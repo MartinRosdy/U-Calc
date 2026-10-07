@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 from .calculator import calculate_climate_scenarios, calculate_heat_loss
 from .catalog import CLIMATES, WINDOWS
 from .models import Boundary, Building, Layer, OpaqueSurface, Opening, SurfaceKind
@@ -5,7 +7,11 @@ from .report import format_report
 
 
 def main() -> None:
-    climate = CLIMATES["tashkent"]
+    climate = replace(
+        CLIMATES["tashkent"],
+        design_c=-14,
+        source_note="Демонстрационное значение -14 °C задано явно, не взято из каталога",
+    )
     building = Building(
         indoor_temperature_c=24,
         outdoor_temperature_c=climate.outdoor_temperature("design"),

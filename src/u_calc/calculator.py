@@ -36,36 +36,75 @@ def ground_floor_zones(
     length_m: float,
     width_m: float,
     insulation_resistance_m2k_w: float = 0.0,
+    exterior_sides: tuple[str, ...] = ("north", "east", "south", "west"),
+    floor_on_joists: bool = False,
 ) -> tuple[GroundFloorZone, ...]:
-    """Split a rectangular slab into 2 m perimeter zones.
+    """Split a rectangular slab into 2 m zones along selected exterior walls.
 
     Base resistances follow Appendix 9 of SHNQ 2.04.05-22. In zone I the
-    four 2x2 m exterior-corner areas are counted twice, following the
+    exterior-corner areas are counted twice, following the
     long-established calculation convention for this zonal method.
     An insulating layer with lambda < 1.2 W/(m*K) adds d/lambda.
+    For a floor on joists the resulting resistance is multiplied by 1.18.
     """
     if not 0 < length_m <= 1_000 or not 0 < width_m <= 1_000:
         raise ValueError("Размеры пола должны быть больше нуля")
     if not 0 <= insulation_resistance_m2k_w <= 50:
         raise ValueError("Сопротивление утеплителя не может быть отрицательным")
+    allowed_sides = {"north", "east", "south", "west"}
+    if not exterior_sides or len(set(exterior_sides)) != len(exterior_sides):
+        raise ValueError("Нужно указать неповторяющиеся наружные стороны пола")
+    if not set(exterior_sides) <= allowed_sides:
+        raise ValueError("Неизвестная наружная сторона пола")
 
-    def inner_area(inset_m: float) -> float:
-        return max(length_m - 2 * inset_m, 0.0) * max(width_m - 2 * inset_m, 0.0)
+    x_breaks = {0.0, length_m}
+    y_breaks = {0.0, width_m}
+    for offset in (2.0, 4.0, 6.0):
+        if "west" in exterior_sides:
+            x_breaks.add(min(offset, length_m))
+        if "east" in exterior_sides:
+            x_breaks.add(max(length_m - offset, 0.0))
+        if "south" in exterior_sides:
+            y_breaks.add(min(offset, width_m))
+        if "north" in exterior_sides:
+            y_breaks.add(max(width_m - offset, 0.0))
 
-    nested_areas = [inner_area(inset) for inset in (0.0, 2.0, 4.0, 6.0)]
-    zone_areas = [
-        nested_areas[0] - nested_areas[1],
-        nested_areas[1] - nested_areas[2],
-        nested_areas[2] - nested_areas[3],
-        nested_areas[3],
-    ]
+    zone_areas = [0.0, 0.0, 0.0, 0.0]
+    xs = sorted(x_breaks)
+    ys = sorted(y_breaks)
+    for x0, x1 in zip(xs, xs[1:], strict=False):
+        for y0, y1 in zip(ys, ys[1:], strict=False):
+            midpoint_x = (x0 + x1) / 2
+            midpoint_y = (y0 + y1) / 2
+            distances = []
+            if "west" in exterior_sides:
+                distances.append(midpoint_x)
+            if "east" in exterior_sides:
+                distances.append(length_m - midpoint_x)
+            if "south" in exterior_sides:
+                distances.append(midpoint_y)
+            if "north" in exterior_sides:
+                distances.append(width_m - midpoint_y)
+            zone_index = min(int(min(distances) // 2), 3)
+            zone_areas[zone_index] += (x1 - x0) * (y1 - y0)
+
+    adjacent_pairs = (
+        ("north", "east"),
+        ("east", "south"),
+        ("south", "west"),
+        ("west", "north"),
+    )
     corner_side = min(2.0, length_m / 2, width_m / 2)
-    zone_areas[0] += 4 * corner_side**2
+    exterior_set = set(exterior_sides)
+    zone_areas[0] += sum(
+        corner_side**2 for first, second in adjacent_pairs if {first, second} <= exterior_set
+    )
     return tuple(
         GroundFloorZone(
             name=f"Пол по грунту — зона {index}",
             area_m2=area,
-            resistance_m2k_w=base_resistance + insulation_resistance_m2k_w,
+            resistance_m2k_w=(base_resistance + insulation_resistance_m2k_w)
+            * (1.18 if floor_on_joists else 1.0),
         )
         for index, (area, base_resistance) in enumerate(
             zip(zone_areas, GROUND_ZONE_RESISTANCES, strict=True), start=1
@@ -130,7 +169,13 @@ def calculate_heat_loss(building: Building) -> HeatLossResult:
             surface.boundary,
             surface.adjacent_temperature_c,
         )
-        watts = u * surface.area_m2 * dt
+        watts = (
+            u
+            * surface.area_m2
+            * dt
+            * (1 + surface.additional_heat_loss_factor)
+            * surface.position_factor
+        )
         transmission += watts
         lines.append(LossLine(surface.name, "Ограждение", surface.area_m2, u, dt, watts))
 
@@ -141,7 +186,13 @@ def calculate_heat_loss(building: Building) -> HeatLossResult:
             opening.boundary,
             None,
         )
-        watts = opening.u_value * opening.area_m2 * dt
+        watts = (
+            opening.u_value
+            * opening.area_m2
+            * dt
+            * (1 + opening.additional_heat_loss_factor)
+            * opening.position_factor
+        )
         transmission += watts
         lines.append(LossLine(opening.name, "Проём", opening.area_m2, opening.u_value, dt, watts))
 
@@ -180,14 +231,30 @@ def calculate_heat_loss(building: Building) -> HeatLossResult:
             )
         )
 
-    ventilation = (
-        0.33
-        * building.air_changes_per_hour
-        * building.volume_m3
-        * full_dt
-        * (1 - building.heat_recovery_efficiency)
+    if building.airflow is None:
+        # Backward compatibility for v0.2 payloads: the historical ACH represented
+        # one recoverable flow. New calculations always provide explicit components.
+        mechanical_flow = building.air_changes_per_hour * building.volume_m3
+        natural_flow = 0.0
+        infiltration_flow = 0.0
+        recovery = building.heat_recovery_efficiency
+    else:
+        mechanical_flow = building.airflow.mechanical_m3_h
+        natural_flow = building.airflow.natural_m3_h
+        infiltration_flow = building.airflow.infiltration_m3_h
+        recovery = building.airflow.heat_recovery_efficiency
+
+    mechanical_loss = 0.33 * mechanical_flow * full_dt * (1 - recovery)
+    natural_loss = 0.33 * natural_flow * full_dt
+    infiltration_loss = 0.33 * infiltration_flow * full_dt
+    airflow_lines = (
+        ("Механическая вентиляция", "Вентиляция", mechanical_flow, mechanical_loss),
+        ("Естественная вентиляция", "Вентиляция", natural_flow, natural_loss),
+        ("Инфильтрация", "Инфильтрация", infiltration_flow, infiltration_loss),
     )
-    lines.append(LossLine("Воздухообмен", "Вентиляция", None, None, full_dt, ventilation))
+    for name, kind, flow, watts in airflow_lines:
+        lines.append(LossLine(name, kind, flow, None, full_dt, watts))
+    ventilation = mechanical_loss + natural_loss + infiltration_loss
     total = transmission + ventilation
     return HeatLossResult(
         transmission_w=transmission,

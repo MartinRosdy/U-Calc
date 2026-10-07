@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from typing import Any
 
 from ..calculator import ground_floor_zones
-from ..catalog import CLIMATES, MATERIALS, WINDOWS, ClimateProfile
+from ..catalog import CLIMATES, DOORS, MATERIALS, WINDOWS, ClimateProfile, ValueSource
 from ..models import (
+    Airflow,
     Boundary,
     Building,
     Layer,
@@ -27,9 +29,14 @@ def build_from_answers(data: dict[str, Any]) -> Building:
         width = _number(data, "width", 0.5, 1_000)
         height = _number(data, "height", 0.1, 100, default=volume_height(data, length, width))
         volume = _number(data, "volume", 1, 10_000_000)
+        geometric_volume = length * width * height
+        if abs(volume - geometric_volume) > max(1.0, geometric_volume * 0.02):
+            raise InvalidCalculationData(
+                "Объём не согласован с длиной × шириной × высотой (допуск 2%)"
+            )
         indoor = _number(data, "indoor", -30, 50)
         outdoor = _number(data, "outdoor", -80, 50)
-        air_changes = _number(data, "air_changes", 0, 10)
+        air_changes = _number(data, "air_changes", 0, 10, default=0.0)
         floor_area = length * width
         surfaces = _wall_surfaces(data)
 
@@ -46,8 +53,22 @@ def build_from_answers(data: dict[str, Any]) -> Building:
                 )
             )
         elif floor_boundary == Boundary.GROUND and data.get("floor_ground_method") == "zonal":
+            if data.get("ground_plan_shape", "rectangle") != "rectangle":
+                raise InvalidCalculationData(
+                    "Нормативное зонирование сейчас поддерживает только прямоугольный план. "
+                    "Разбейте сложный план на прямоугольники и рассчитайте их отдельно."
+                )
             insulation_resistance = _ground_insulation_resistance(data)
-            ground_zones = ground_floor_zones(length, width, insulation_resistance)
+            exterior_sides = tuple(
+                data.get("ground_exterior_sides") or ("north", "east", "south", "west")
+            )
+            ground_zones = ground_floor_zones(
+                length,
+                width,
+                insulation_resistance,
+                exterior_sides,
+                bool(data.get("floor_on_joists", False)),
+            )
         else:
             surfaces.append(
                 OpaqueSurface(
@@ -107,6 +128,7 @@ def build_from_answers(data: dict[str, Any]) -> Building:
             ground_floor_zones=ground_zones,
             linear_thermal_bridges=bridges,
             assumptions=assumptions_from_answers(data),
+            airflow=_airflow_from_answers(data),
             air_changes_per_hour=air_changes,
             heat_recovery_efficiency=_number(
                 data, "heat_recovery_efficiency", 0, 0.95, default=0.0
@@ -120,10 +142,56 @@ def build_from_answers(data: dict[str, Any]) -> Building:
         raise InvalidCalculationData(f"Некорректные исходные данные: {exc}") from exc
 
 
+def _airflow_from_answers(data: dict[str, Any]) -> Airflow | None:
+    component_keys = {
+        "mechanical_ventilation_m3_h",
+        "natural_ventilation_m3_h",
+        "infiltration_m3_h",
+    }
+    if not component_keys.intersection(data):
+        return None
+    return Airflow(
+        mechanical_m3_h=_number(data, "mechanical_ventilation_m3_h", 0, 10_000_000, default=0.0),
+        natural_m3_h=_number(data, "natural_ventilation_m3_h", 0, 10_000_000, default=0.0),
+        infiltration_m3_h=_number(data, "infiltration_m3_h", 0, 10_000_000, default=0.0),
+        heat_recovery_efficiency=_number(data, "heat_recovery_efficiency", 0, 0.95, default=0.0),
+        input_basis=str(data.get("airflow_input_basis", "components_m3_h")),
+    )
+
+
 def climate_from_answers(data: dict[str, Any]) -> ClimateProfile | None:
     key = data.get("climate_key")
     if key in CLIMATES:
-        return CLIMATES[key]
+        profile = CLIMATES[key]
+        if data.get("confirmed_design_c") is not None:
+            confirmed_design = _number(data, "confirmed_design_c", -80, 15)
+            return replace(
+                profile,
+                design_c=confirmed_design,
+                source_note=(
+                    "средние и экстремумы — ШНҚ 2.01.01-22; расчётная температура "
+                    "параметра Б подтверждена пользователем"
+                ),
+                provenance=profile.provenance
+                + (
+                    ValueSource(
+                        parameter="design_c",
+                        value=confirmed_design,
+                        unit="°C",
+                        document="ШНҚ 2.01.01-22",
+                        edition="утверждён 19.12.2022",
+                        location=(
+                            "п. 14 и приложение, таблица 4, параметр Б холодного периода; "
+                            "значение введено пользователем"
+                        ),
+                        url="https://lex.uz/docs/-6363141",
+                        observation_period="подтверждается пользователем",
+                        updated_at="в момент расчёта",
+                        status="user_confirmed",
+                    ),
+                ),
+            )
+        return profile
     if key in {None, "manual"}:
         return None
     if key != "custom":
@@ -146,6 +214,11 @@ def climate_from_answers(data: dict[str, Any]) -> ClimateProfile | None:
 
 def assumptions_from_answers(data: dict[str, Any]) -> tuple[str, ...]:
     assumptions: list[str] = []
+    if data.get("airflow_input_basis") == "quick_estimate":
+        assumptions.append(
+            "Воздушные потери заданы упрощённой общей кратностью как невосстанавливаемый "
+            "поток. Для подбора рекуператора нужен раздельный расход вентиляции и инфильтрации."
+        )
     window_groups = data.get("window_groups") or []
     has_unassigned_windows = any(not group.get("wall_name") for group in window_groups)
     if data.get("wall_groups") and (
@@ -175,12 +248,20 @@ def assumptions_from_answers(data: dict[str, Any]) -> tuple[str, ...]:
             "это не нормативный зональный метод."
         )
     if data.get("floor_ground_method") == "zonal":
+        sides = data.get("ground_exterior_sides")
+        side_note = (
+            ", наружные стороны: " + ", ".join(str(side) for side in sides)
+            if sides
+            else "; для старого расчёта принято, что наружные все четыре стороны"
+        )
         assumptions.append(
             "Пол по грунту рассчитан по приложению 9 ШНҚ 2.04.05-22: "
             "полосы шириной 2 м с R=2,1 / 4,3 / 8,5 / 14,2 м²·К/Вт; "
             "угловые участки зоны I учтены дважды; добавлено сопротивление "
-            "указанного слоя с λ<1,2 Вт/(м·К)."
+            f"указанного слоя с λ<1,2 Вт/(м·К){side_note}."
         )
+        if data.get("floor_on_joists"):
+            assumptions.append("Для пола на лагах сопротивления зон умножены на 1,18.")
     if data.get("thermal_bridge_factor", 0) > 0:
         assumptions.append(
             "Процентная поправка мостиков холода применена ко всей базовой "
@@ -281,6 +362,8 @@ def _openings(data: dict[str, Any]) -> list[Opening]:
                     f"{_short_name(group, 'name', 'окна')} ({count} шт.)",
                     _mapping_number(group, "area_m2", 0.01, 10_000),
                     _mapping_number(group, "u_value", 0.1, 10),
+                    value_status="passport_user_input",
+                    source_note="Паспортный U введён пользователем",
                 )
             )
     else:
@@ -291,7 +374,16 @@ def _openings(data: dict[str, Any]) -> list[Opening]:
                 raise InvalidCalculationData("Неизвестный тип окна")
             count = int(_number(data, "window_count", 0, 500, default=0))
             name = f"Окна ({count} шт.)" if count else "Окна"
-            result.append(Opening(name, area, WINDOWS[window_key].u_value))
+            window = WINDOWS[window_key]
+            result.append(
+                Opening(
+                    name,
+                    area,
+                    window.u_value,
+                    value_status=window.value_status,
+                    source_note=window.source_note,
+                )
+            )
 
     door_groups = data.get("door_groups") or []
     if door_groups:
@@ -302,13 +394,23 @@ def _openings(data: dict[str, Any]) -> list[Opening]:
                     f"{_short_name(group, 'name', 'двери')} ({count} шт.)",
                     _mapping_number(group, "area_m2", 0.01, 10_000),
                     _mapping_number(group, "u_value", 0.1, 10),
+                    value_status="passport_user_input",
+                    source_note="Паспортный U введён пользователем",
                 )
             )
     else:
         area = _number(data, "door_area", 0, 10_000)
         if area:
+            door_key = data.get("door_type")
+            door = DOORS.get(door_key) if isinstance(door_key, str) else None
             result.append(
-                Opening("Наружные двери", area, _number(data, "door_u_value", 0.1, 10, default=2.0))
+                Opening(
+                    "Наружные двери",
+                    area,
+                    _number(data, "door_u_value", 0.1, 10, default=2.0),
+                    value_status=door.value_status if door else "legacy_reference",
+                    source_note=door.source_note if door else "Старое справочное значение U",
+                )
             )
     return result
 

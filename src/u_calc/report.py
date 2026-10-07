@@ -15,7 +15,11 @@ def _layer_description(layer: Layer) -> str:
     conductivity = (
         layer.conductivity_w_mk if layer.conductivity_w_mk is not None else material.conductivity
     )
-    return f"{name} {layer.thickness_m * 100:g} см (λ={conductivity:g})"
+    if material is None or layer.conductivity_w_mk is not None:
+        status = "паспортное/ручное значение"
+    else:
+        status = f"{material.value_status}; {material.table_row}"
+    return f"{name} {layer.thickness_m * 100:g} см (λ={conductivity:g} Вт/(м·К); {status})"
 
 
 def _surface_description(surface: OpaqueSurface) -> str:
@@ -25,7 +29,10 @@ def _surface_description(surface: OpaqueSurface) -> str:
     layers = ", ".join(_layer_description(layer) for layer in surface.layers)
     if not layers:
         layers = "тепловой поток принят равным нулю"
-    return f"• {surface.name}: {surface.area_m2:g} м² → {boundary}; {layers}"
+    return (
+        f"• {surface.name}: {surface.area_m2:g} м² → {boundary}; {layers}; "
+        f"β={surface.additional_heat_loss_factor:g}; n={surface.position_factor:g}"
+    )
 
 
 def format_report(
@@ -41,6 +48,19 @@ def format_report(
         if building.linear_thermal_bridges
         else f"поправка {building.thermal_bridge_factor * 100:g}%"
     )
+    if building.airflow is None:
+        airflow_description = (
+            f"legacy ACH {building.air_changes_per_hour:g} 1/ч; "
+            f"рекуперация {building.heat_recovery_efficiency * 100:g}%"
+        )
+    else:
+        airflow_description = (
+            f"механическая {building.airflow.mechanical_m3_h:g} м³/ч; "
+            f"естественная {building.airflow.natural_m3_h:g} м³/ч; "
+            f"инфильтрация {building.airflow.infiltration_m3_h:g} м³/ч; "
+            f"рекуперация механической части "
+            f"{building.airflow.heat_recovery_efficiency * 100:g}%"
+        )
     lines = [
         "🔥 Результат расчёта теплопотерь",
         "",
@@ -48,8 +68,7 @@ def format_report(
         f"Отапливаемый объём: {building.volume_m3:g} м³",
         f"Температуры: {building.indoor_temperature_c:.1f} °C / "
         f"{building.outdoor_temperature_c:.1f} °C (ΔT {delta_t:.1f} K)",
-        f"Воздухообмен: {building.air_changes_per_hour:g} 1/ч; "
-        f"рекуперация {building.heat_recovery_efficiency * 100:g}%",
+        f"Воздухообмен: {airflow_description}",
         f"Мостики холода: {bridge_description}",
     ]
     if all(value is not None for value in (building.length_m, building.width_m, building.height_m)):
@@ -78,6 +97,12 @@ def format_report(
         )
     lines.extend(["", "Конструкции:"])
     lines.extend(_surface_description(surface) for surface in building.opaque_surfaces)
+    for opening in building.openings:
+        lines.append(
+            f"• {opening.name}: {opening.area_m2:g} м²; U={opening.u_value:g} Вт/(м²·К); "
+            f"{opening.value_status}; {opening.source_note}; "
+            f"β={opening.additional_heat_loss_factor:g}; n={opening.position_factor:g}"
+        )
     if building.ground_floor_zones:
         lines.append(
             f"• Пол по грунту: {building.heated_area_m2:g} м² геометрической площади → "
@@ -116,6 +141,13 @@ def format_report(
                 "В отопительную нагрузку не входит.",
             ]
         )
+        if climate.provenance:
+            lines.append("Происхождение климатических значений:")
+            lines.extend(
+                f"• {item.parameter}={item.value:g} {item.unit}: {item.document}, "
+                f"{item.location}; статус {item.status}."
+                for item in climate.provenance
+            )
     if climate and scenario_results:
         lines.extend(["", "Мощность по климатическим сценариям (включая запас):"])
         for key in ("economy", "design", "future", "extreme"):
@@ -130,6 +162,9 @@ def format_report(
         [
             "",
             f"Версии: расчётный движок {ENGINE_VERSION}; каталог {CATALOG_VERSION}.",
+            "Нормативные коэффициенты: без структурированной ориентации β=0; "
+            "коэффициент положения ограждения n=1,0. Эти значения показаны для каждой "
+            "конструкции и не подбираются по её названию.",
             "Важно: расчётная тепловая нагрузка и рекомендуемая мощность оборудования "
             "с эксплуатационным запасом показаны отдельно. ГВС не включено. "
             "Месячное потребление энергии не рассчитывается. Результат не является "

@@ -10,11 +10,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends gosu \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml requirements.txt README.md ./
+COPY pyproject.toml requirements.txt requirements-lock.txt README.md ./
 COPY src ./src
 COPY docker-entrypoint.sh /usr/local/bin/u-calc-entrypoint
 
-RUN pip install --no-cache-dir -r requirements.txt \
+RUN pip install --no-cache-dir -r requirements.txt -c requirements-lock.txt \
     && pip install --no-cache-dir --no-deps . \
     && addgroup --system ucalc \
     && adduser --system --ingroup ucalc --home /app ucalc \

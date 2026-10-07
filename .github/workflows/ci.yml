@@ -25,8 +25,12 @@ jobs:
       - run: python scripts/sync_requirements.py
       - run: git diff --exit-code -- requirements.txt
       - run: ruff check src tests scripts main.py
-      - run: pytest -q
+      - run: coverage run -m pytest -q
+      - run: coverage report --fail-under=70
       - run: python -m compileall -q src tests scripts main.py
+      - run: python -m build
+      - run: u-calc-demo > /tmp/u-calc-demo.txt
+      - run: test -s /tmp/u-calc-demo.txt
 
   docker:
     runs-on: ubuntu-latest
@@ -38,3 +42,5 @@ jobs:
           context: .
           push: false
           tags: u-calc:ci
+          load: true
+      - run: docker run --rm --entrypoint python u-calc:ci -c "import u_calc.pdf_report; print('docker-smoke-ok')"

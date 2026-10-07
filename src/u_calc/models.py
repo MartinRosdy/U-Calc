@@ -58,6 +58,8 @@ class OpaqueSurface:
     boundary: Boundary = Boundary.OUTDOOR
     adjacent_temperature_c: float | None = None
     kind: SurfaceKind = SurfaceKind.WALL
+    additional_heat_loss_factor: float = 0.0
+    position_factor: float = 1.0
 
     def __post_init__(self) -> None:
         _require_finite_range(self.area_m2, "Площадь ограждения, м²", 0.0, 100_000.0)
@@ -67,6 +69,8 @@ class OpaqueSurface:
             _require_finite_range(
                 self.adjacent_temperature_c, "Температура смежной зоны, °C", -80.0, 70.0
             )
+        _require_finite_range(self.additional_heat_loss_factor, "Дополнительные потери β", 0.0, 5.0)
+        _require_finite_range(self.position_factor, "Коэффициент положения n", 0.0, 2.0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,10 +79,16 @@ class Opening:
     area_m2: float
     u_value: float
     boundary: Boundary = Boundary.OUTDOOR
+    additional_heat_loss_factor: float = 0.0
+    position_factor: float = 1.0
+    value_status: str = "unspecified"
+    source_note: str = "Источник U не указан"
 
     def __post_init__(self) -> None:
         _require_finite_range(self.area_m2, "Площадь проёма, м²", 0.01, 10_000.0)
         _require_finite_range(self.u_value, "U-value проёма, Вт/(м²·К)", 0.1, 10.0)
+        _require_finite_range(self.additional_heat_loss_factor, "Дополнительные потери β", 0.0, 5.0)
+        _require_finite_range(self.position_factor, "Коэффициент положения n", 0.0, 2.0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +114,28 @@ class GroundFloorZone:
 
 
 @dataclass(frozen=True, slots=True)
+class Airflow:
+    """Design airflows; heat recovery applies only to the mechanical component."""
+
+    mechanical_m3_h: float = 0.0
+    natural_m3_h: float = 0.0
+    infiltration_m3_h: float = 0.0
+    heat_recovery_efficiency: float = 0.0
+    input_basis: str = "components_m3_h"
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.mechanical_m3_h, "Механическая вентиляция, м³/ч"),
+            (self.natural_m3_h, "Естественная вентиляция, м³/ч"),
+            (self.infiltration_m3_h, "Инфильтрация, м³/ч"),
+        ):
+            _require_finite_range(value, label, 0.0, 10_000_000.0)
+        _require_finite_range(self.heat_recovery_efficiency, "КПД рекуперации", 0.0, 0.95)
+        if self.input_basis not in {"components_m3_h", "components_ach", "quick_estimate"}:
+            raise ValueError("Неизвестный способ задания воздухообмена")
+
+
+@dataclass(frozen=True, slots=True)
 class Building:
     indoor_temperature_c: float
     outdoor_temperature_c: float
@@ -117,6 +149,8 @@ class Building:
     ground_floor_zones: tuple[GroundFloorZone, ...] = field(default_factory=tuple)
     linear_thermal_bridges: tuple[LinearThermalBridge, ...] = field(default_factory=tuple)
     assumptions: tuple[str, ...] = field(default_factory=tuple)
+    airflow: Airflow | None = None
+    # Compatibility fields for calculations saved before format 0.3.
     air_changes_per_hour: float = 0.5
     heat_recovery_efficiency: float = 0.0
     thermal_bridge_factor: float = 0.0

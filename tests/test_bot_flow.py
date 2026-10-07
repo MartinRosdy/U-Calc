@@ -7,6 +7,8 @@ from u_calc.bot import (
     _go_back,
     _send_long_message,
     climate,
+    confirmation,
+    safety_factor,
     wall_material,
 )
 
@@ -48,14 +50,57 @@ class FakeCallback:
 
 
 class ApartmentFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_safety_opens_confirmation_card_before_calculation(self) -> None:
+        state = FakeState(
+            {
+                "building_type": "house",
+                "climate_key": "manual",
+                "outdoor": -15,
+                "indoor": 24,
+                "length": 10,
+                "width": 8,
+                "height": 3,
+                "wall_gross_area": 80,
+                "window_area": 8,
+                "door_area": 2,
+                "air_changes": 0.5,
+            }
+        )
+        message = FakeMessage()
+        callback = FakeCallback("safety:1.10", message)
+        await safety_factor(callback, state)
+        self.assertEqual(state.state, Survey.confirmation)
+        self.assertIn("Проверьте исходные данные", message.answers[-1][0])
+        buttons = [
+            button.text
+            for row in message.answers[-1][1]["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        self.assertEqual(
+            buttons,
+            [
+                "Рассчитать",
+                "Изменить климат",
+                "Изменить стены",
+                "Изменить проёмы",
+                "Изменить пол/потолок",
+                "Изменить вентиляцию",
+                "Отмена",
+            ],
+        )
+
+    async def test_confirmation_can_return_to_wall_editor(self) -> None:
+        state = FakeState({})
+        message = FakeMessage()
+        await confirmation(FakeCallback("confirm:walls", message), state, None)
+        self.assertEqual(state.state, Survey.wall_method)
+
     async def test_back_restores_previous_state_and_answers(self) -> None:
         state = FakeState(
             {
                 "indoor": 24,
                 "length": 10,
-                "_back_stack": [
-                    {"state": Survey.indoor.state, "data": {"outdoor": -14}}
-                ],
+                "_back_stack": [{"state": Survey.indoor.state, "data": {"outdoor": -14}}],
             }
         )
         state.state = Survey.dimensions

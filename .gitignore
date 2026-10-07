@@ -52,3 +52,7 @@ __MACOSX/
 # Docker/local overrides
 compose.override.yaml
 docker-compose.override.yml
+
+# Generated files
+output/
+tmp/

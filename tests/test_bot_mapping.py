@@ -1,12 +1,36 @@
 import unittest
 
-from u_calc.services.building_factory import build_from_answers, climate_from_answers
+from u_calc.services.building_factory import (
+    InvalidCalculationData,
+    build_from_answers,
+    climate_from_answers,
+)
 
 _build_from_answers = build_from_answers
 _climate_from_answers = climate_from_answers
 
 
 class BotMappingTests(unittest.TestCase):
+    def test_complex_ground_plan_is_explicitly_rejected(self) -> None:
+        data = {
+            "wall_material": "brick_solid",
+            "wall_thickness": 0.25,
+            "wall_gross_area": 60,
+            "window_area": 0,
+            "door_area": 0,
+            "length": 10,
+            "width": 8,
+            "floor_boundary": "ground",
+            "floor_ground_method": "zonal",
+            "ground_plan_shape": "complex",
+            "ceiling_boundary": "heated",
+            "indoor": 24,
+            "outdoor": -14,
+            "volume": 240,
+        }
+        with self.assertRaisesRegex(InvalidCalculationData, "только прямоугольный"):
+            _build_from_answers(data)
+
     def test_normative_ground_floor_uses_zones_and_explicit_insulation(self) -> None:
         building = _build_from_answers(
             {

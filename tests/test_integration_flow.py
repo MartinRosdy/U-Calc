@@ -10,17 +10,22 @@ from u_calc.bot import (
     calculation_mode,
     ceiling_boundary,
     climate,
+    confirmation,
     dimensions,
     door_count,
     door_dimensions,
     door_method,
     door_type,
     floor_boundary,
+    ground_exterior_sides,
+    ground_floor_construction,
     heat_recovery,
     indoor,
     insulated,
     insulation_material,
     insulation_thickness,
+    object_name,
+    profile_design,
     safety_factor,
     scenario,
     start,
@@ -71,6 +76,9 @@ class FakeMessage:
     async def answer(self, text, **kwargs) -> None:
         self.outbox.append((text, kwargs))
 
+    async def answer_document(self, document, **kwargs) -> None:
+        self.outbox.append((document, kwargs))
+
 
 class FakeCallback:
     def __init__(self, data: str, message: FakeMessage) -> None:
@@ -101,7 +109,9 @@ class FullDialogIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.state, Survey.calculation_mode)
         await press(calculation_mode, "mode:quick", Survey.calculation_mode)
         await press(building_type, "type:house", Survey.building_type)
+        await send(object_name, "Дом тестовый", Survey.object_name)
         await press(climate, "climate:tashkent", Survey.climate)
+        await send(profile_design, "-14", Survey.profile_design)
         await press(scenario, "scenario:design", Survey.scenario)
         await send(indoor, "24", Survey.indoor)
         await send(dimensions, "10 8 3", Survey.dimensions)
@@ -126,6 +136,16 @@ class FullDialogIntegrationTests(unittest.IsolatedAsyncioTestCase):
             surface_adjacent_mode,
             "adjacent:floor:zonal",
             Survey.surface_adjacent_mode,
+        )
+        await press(
+            ground_exterior_sides,
+            "gsides:n,e,s,w",
+            Survey.ground_exterior_sides,
+        )
+        await press(
+            ground_floor_construction,
+            "ground_floor:solid",
+            Survey.ground_floor_construction,
         )
         await press(surface_insulated, "sins:yes", Survey.surface_insulated)
         await press(
@@ -162,12 +182,16 @@ class FullDialogIntegrationTests(unittest.IsolatedAsyncioTestCase):
             repository = CalculationRepository(Path(directory) / "u_calc.db")
             repository.initialize()
             self.assertEqual(state.state, Survey.safety_factor)
-            await safety_factor(FakeCallback("safety:1.10", message), state, repository)
+            await safety_factor(FakeCallback("safety:1.10", message), state)
+            self.assertEqual(state.state, Survey.confirmation)
+            await confirmation(FakeCallback("confirm:calculate", message), state, repository)
             records = repository.recent(777)
 
         self.assertIsNone(state.state)
         self.assertEqual(len(records), 1)
         self.assertGreater(records[0].recommended_kw, 0)
+        self.assertIn("calculation_snapshot", records[0].answers)
+        self.assertEqual(records[0].answers["calculation_snapshot"]["report"], records[0].report)
         self.assertIn("Газоблок D500 30 см", records[0].report)
         self.assertIn("Пол по грунту", records[0].report)
         self.assertIn("Мощность по климатическим сценариям", records[0].report)

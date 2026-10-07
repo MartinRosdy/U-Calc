@@ -1,19 +1,26 @@
 [build-system]
-requires = ["setuptools>=75"]
+requires = ["setuptools==80.10.2"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "u-calc"
-version = "0.2.0"
+version = "0.3.0"
 description = "Telegram bot and calculation core for building heat-loss estimates"
 requires-python = ">=3.11"
 dependencies = [
-    "aiogram>=3.28,<4",
-    "tzdata>=2025.2",
+    "aiogram==3.31.0",
+    "reportlab==4.4.9",
+    "tzdata==2026.5",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.9"]
+dev = [
+    "build==1.4.0",
+    "coverage==7.13.5",
+    "pytest==9.1.1",
+    "ruff==0.16.10",
+    "setuptools==80.10.2",
+]
 
 [project.scripts]
 u-calc-bot = "u_calc.bot:main"
@@ -21,6 +28,9 @@ u-calc-demo = "u_calc.demo:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+u_calc = ["assets/fonts/*.ttf", "assets/fonts/*.txt"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

@@ -48,6 +48,15 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(InvalidCalculationData, "floor_boundary"):
             build_from_answers(data)
 
+    def test_volume_must_match_dimensions_within_two_percent(self) -> None:
+        data = base_answers()
+        data["volume"] = 180
+        with self.assertRaisesRegex(InvalidCalculationData, "Объём не согласован"):
+            build_from_answers(data)
+
+        data["volume"] = 146
+        self.assertEqual(build_from_answers(data).volume_m3, 146)
+
     def test_duplicate_wall_names_are_case_insensitive(self) -> None:
         with self.assertRaisesRegex(ValueError, "уже использовано"):
             parse_wall_groups("Север | 20 | кирпич | 25\nсЕвЕр | 15 | газоблок | 30")

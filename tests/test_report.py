@@ -37,7 +37,7 @@ class ReportTests(unittest.TestCase):
         )
         self.assertIn("Отапливаемый объём: 240 м³", report)
         self.assertIn("Газоблок D500 30 см", report)
-        self.assertIn("материал по паспорту 5 см (λ=0.037)", report)
+        self.assertIn("материал по паспорту 5 см (λ=0.037 Вт/(м·К)", report)
         self.assertIn("Пол по грунту: 80 м²", report)
         self.assertIn("средний жаркий месяц 27.8 °C", report)
         self.assertIn("В отопительную нагрузку не входит", report)

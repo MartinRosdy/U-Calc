@@ -74,4 +74,90 @@ class StorageTests(unittest.TestCase):
                 journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
             self.assertIn("engine_version", columns)
             self.assertIn("catalog_version", columns)
+            self.assertIn("calculation_version", columns)
+            self.assertIn("norms_version", columns)
             self.assertEqual(journal_mode, "wal")
+
+    def test_draft_survives_repository_restart_and_can_be_deleted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "draft.db"
+            repository = CalculationRepository(path)
+            repository.initialize()
+            repository.save_draft(
+                100,
+                "Survey:wall_thickness",
+                {"object_name": "Дом", "wall_material": "brick_solid"},
+            )
+
+            restarted = CalculationRepository(path)
+            restarted.initialize()
+            draft = restarted.load_draft(100)
+            self.assertIsNotNone(draft)
+            self.assertEqual(draft.current_step, "Survey:wall_thickness")
+            self.assertEqual(draft.data["object_name"], "Дом")
+            self.assertIsNone(restarted.load_draft(200))
+            self.assertTrue(restarted.delete_draft(100))
+            self.assertIsNone(restarted.load_draft(100))
+
+    def test_versions_copy_and_comparison_remain_private(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = CalculationRepository(Path(directory) / "versions.db")
+            repository.initialize()
+            first_id = repository.save(
+                100,
+                {"object_name": "Склад", "indoor": 20},
+                5,
+                5.5,
+                "first",
+            )
+            second_id = repository.save(
+                100,
+                {"object_name": "Склад", "indoor": 22},
+                6,
+                6.6,
+                "second",
+                parent_id=first_id,
+            )
+            records = repository.recent(100)
+            self.assertEqual([record.calculation_version for record in records], [2, 1])
+            self.assertEqual(records[0].parent_id, first_id)
+            copied = repository.copy_answers_for_user(100, first_id)
+            self.assertEqual(copied["parent_calculation_id"], first_id)
+            self.assertEqual(
+                repository.compare_for_user(100, first_id, second_id)["indoor"],
+                (20, 22),
+            )
+            self.assertIsNone(repository.copy_answers_for_user(200, first_id))
+            self.assertIsNone(repository.compare_for_user(200, first_id, second_id))
+
+    def test_repeated_final_request_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = CalculationRepository(Path(directory) / "idempotent.db")
+            repository.initialize()
+            first = repository.save(
+                100,
+                {"object_name": "Дом"},
+                5,
+                5.5,
+                "report",
+                request_id="same-final-callback",
+            )
+            repeated = repository.save(
+                100,
+                {"object_name": "Дом"},
+                5,
+                5.5,
+                "report",
+                request_id="same-final-callback",
+            )
+            other_user = repository.save(
+                200,
+                {"object_name": "Дом"},
+                5,
+                5.5,
+                "report",
+                request_id="same-final-callback",
+            )
+            self.assertEqual(first, repeated)
+            self.assertNotEqual(first, other_user)
+            self.assertEqual(len(repository.recent(100)), 1)
