@@ -1,0 +1,15 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN:?Set BOT_TOKEN in the environment}
+      DATABASE_PATH: /app/data/u_calc.db
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      APP_TIMEZONE: ${APP_TIMEZONE:-Asia/Tashkent}
+      ALLOWED_USER_IDS: ${ALLOWED_USER_IDS:-}
+    volumes:
+      - u_calc_data:/app/data
+
+volumes:
+  u_calc_data:

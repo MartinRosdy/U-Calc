@@ -1,0 +1,4 @@
+# Generated from project.dependencies in pyproject.toml.
+# Update with: python scripts/sync_requirements.py
+aiogram>=3.28,<4
+tzdata>=2025.2
