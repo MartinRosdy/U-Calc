@@ -10,12 +10,24 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, TelegramObject
 
 from .config import Settings
+from .i18n import translate as tr
 from .storage import CalculationRepository
 
 
 class AccessMiddleware(BaseMiddleware):
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        repository: CalculationRepository | None = None,
+    ) -> None:
         self.settings = settings
+        self.repository = repository
+
+    async def _locale(self, user_id: int) -> str:
+        if self.repository is None:
+            return "ru"
+        settings = await asyncio.to_thread(self.repository.get_user_settings, user_id)
+        return settings.locale
 
     async def __call__(
         self,
@@ -25,7 +37,7 @@ class AccessMiddleware(BaseMiddleware):
     ) -> Any:
         user = getattr(event, "from_user", None)
         if user is not None and not self.settings.is_user_allowed(user.id):
-            text = "Доступ к U-Calc ограничен владельцем бота."
+            text = tr("safety.access_denied", await self._locale(user.id))
             if isinstance(event, CallbackQuery):
                 await event.answer(text, show_alert=True)
             else:
@@ -39,10 +51,23 @@ class AccessMiddleware(BaseMiddleware):
 class PublicSafetyMiddleware(BaseMiddleware):
     """Bound input size and per-user update rate for public deployments."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        repository: CalculationRepository | None = None,
+    ) -> None:
         self.settings = settings
+        self.repository = repository
         self.events: dict[int, deque[float]] = defaultdict(deque)
+        self.calculations: dict[int, deque[float]] = defaultdict(deque)
+        self._last_cleanup = 0.0
         self.audit = logging.getLogger("u_calc.audit")
+
+    async def _locale(self, user_id: int) -> str:
+        if self.repository is None:
+            return "ru"
+        settings = await asyncio.to_thread(self.repository.get_user_settings, user_id)
+        return settings.locale
 
     async def __call__(
         self,
@@ -57,16 +82,23 @@ class PublicSafetyMiddleware(BaseMiddleware):
             self.settings.max_message_length
         ):
             await event.answer(
-                f"Сообщение слишком длинное. Максимум {self.settings.max_message_length} символов."
+                tr(
+                    "safety.message_too_long",
+                    await self._locale(user.id),
+                    limit=self.settings.max_message_length,
+                )
             )
             self.audit.warning("oversized_input user_id=%s", user.id)
             return None
         now = time.monotonic()
+        if now - self._last_cleanup >= 60:
+            self._prune_inactive_users(now)
+            self._last_cleanup = now
         events = self.events[user.id]
         while events and events[0] <= now - 60:
             events.popleft()
         if len(events) >= self.settings.rate_limit_per_minute:
-            text = "Слишком много действий. Подождите минуту и продолжите."
+            text = tr("safety.rate_limited", await self._locale(user.id))
             if isinstance(event, CallbackQuery):
                 await event.answer(text, show_alert=True)
             else:
@@ -74,12 +106,72 @@ class PublicSafetyMiddleware(BaseMiddleware):
             self.audit.warning("rate_limited user_id=%s", user.id)
             return None
         events.append(now)
+        if isinstance(event, CallbackQuery) and getattr(event, "data", None) == "confirm:calculate":
+            calculations = self.calculations[user.id]
+            while calculations and calculations[0] <= now - 60:
+                calculations.popleft()
+            if len(calculations) >= self.settings.calculation_rate_limit_per_minute:
+                await event.answer(
+                    tr(
+                        "safety.calculation_rate_limited",
+                        await self._locale(user.id),
+                    ),
+                    show_alert=True,
+                )
+                self.audit.warning("calculation_rate_limited user_id=%s", user.id)
+                return None
+            calculations.append(now)
         self.audit.info(
             "telegram_action user_id=%s kind=%s",
             user.id,
             type(event).__name__,
         )
         return await handler(event, data)
+
+    def _prune_inactive_users(self, now: float) -> None:
+        """Discard expired rate-limit buckets so one-time users do not leak memory."""
+        cutoff = now - 60
+        for user_id, events in list(self.events.items()):
+            while events and events[0] <= cutoff:
+                events.popleft()
+            if not events:
+                del self.events[user_id]
+        for user_id, calculations in list(self.calculations.items()):
+            while calculations and calculations[0] <= cutoff:
+                calculations.popleft()
+            if not calculations:
+                del self.calculations[user_id]
+
+
+class UserMutationLockMiddleware(BaseMiddleware):
+    """Serialize state-changing updates for each user without blocking other users."""
+
+    def __init__(self) -> None:
+        self._locks: dict[int, tuple[asyncio.Lock, int]] = {}
+        self._registry_lock = asyncio.Lock()
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        user = getattr(event, "from_user", None)
+        if user is None:
+            return await handler(event, data)
+        async with self._registry_lock:
+            lock, users = self._locks.get(user.id, (asyncio.Lock(), 0))
+            self._locks[user.id] = (lock, users + 1)
+        try:
+            async with lock:
+                return await handler(event, data)
+        finally:
+            async with self._registry_lock:
+                _, users = self._locks[user.id]
+                if users == 1:
+                    self._locks.pop(user.id, None)
+                else:
+                    self._locks[user.id] = (lock, users - 1)
 
 
 class NavigationMiddleware(BaseMiddleware):
@@ -131,7 +223,7 @@ class DraftPersistenceMiddleware(BaseMiddleware):
         current_state = await state.get_state()
         if current_state is None:
             await asyncio.to_thread(self.repository.delete_draft, user.id)
-        else:
+        elif current_state.startswith("Survey:"):
             state_data = await state.get_data()
             await asyncio.to_thread(
                 self.repository.save_draft,

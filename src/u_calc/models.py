@@ -17,6 +17,17 @@ class SurfaceKind(StrEnum):
     ROOF = "roof"
 
 
+class Orientation(StrEnum):
+    NORTH = "north"
+    NORTH_EAST = "north_east"
+    EAST = "east"
+    SOUTH_EAST = "south_east"
+    SOUTH = "south"
+    SOUTH_WEST = "south_west"
+    WEST = "west"
+    NORTH_WEST = "north_west"
+
+
 def _require_finite_range(
     value: float,
     label: str,
@@ -60,6 +71,7 @@ class OpaqueSurface:
     kind: SurfaceKind = SurfaceKind.WALL
     additional_heat_loss_factor: float = 0.0
     position_factor: float = 1.0
+    orientation: Orientation | None = None
 
     def __post_init__(self) -> None:
         _require_finite_range(self.area_m2, "Площадь ограждения, м²", 0.0, 100_000.0)
@@ -71,6 +83,8 @@ class OpaqueSurface:
             )
         _require_finite_range(self.additional_heat_loss_factor, "Дополнительные потери β", 0.0, 5.0)
         _require_finite_range(self.position_factor, "Коэффициент положения n", 0.0, 2.0)
+        if self.orientation is not None and self.orientation not in tuple(Orientation):
+            raise ValueError("Неизвестная ориентация ограждения")
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,12 +97,15 @@ class Opening:
     position_factor: float = 1.0
     value_status: str = "unspecified"
     source_note: str = "Источник U не указан"
+    orientation: Orientation | None = None
 
     def __post_init__(self) -> None:
         _require_finite_range(self.area_m2, "Площадь проёма, м²", 0.01, 10_000.0)
         _require_finite_range(self.u_value, "U-value проёма, Вт/(м²·К)", 0.1, 10.0)
         _require_finite_range(self.additional_heat_loss_factor, "Дополнительные потери β", 0.0, 5.0)
         _require_finite_range(self.position_factor, "Коэффициент положения n", 0.0, 2.0)
+        if self.orientation is not None and self.orientation not in tuple(Orientation):
+            raise ValueError("Неизвестная ориентация проёма")
 
 
 @dataclass(frozen=True, slots=True)

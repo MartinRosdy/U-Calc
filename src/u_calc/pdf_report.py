@@ -8,6 +8,7 @@ from html import escape
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from reportlab import rl_config
 from reportlab.lib import colors
@@ -27,10 +28,49 @@ from reportlab.platypus import (
 )
 
 from .catalog import CATALOG_VERSION, ENGINE_VERSION
+from .i18n import normalize_locale
+from .i18n import translate as tr
 from .services.calculation_service import CalculationBundle
 from .storage import NORMS_VERSION
 
 rl_config.warnOnMissingFontGlyphs = 0
+
+_UZ_LINE_TEXT = {
+    "Ограждение": "To‘siq",
+    "Проём": "Ochiq",
+    "Пол по грунту": "Gruntdagi pol",
+    "Поправка": "Tuzatish",
+    "Линейный мостик": "Chiziqli issiqlik ko‘prigi",
+    "Вентиляция": "Ventilyatsiya",
+    "Инфильтрация": "Infiltratsiya",
+    "Механическая вентиляция": "Mexanik ventilyatsiya",
+    "Естественная вентиляция": "Tabiiy ventilyatsiya",
+    "Мостики холода (оценка)": "Issiqlik ko‘priklari (baho)",
+    "Пол над соседом": "Pastki qo‘shni ustidagi pol",
+    "Пол": "Pol",
+    "Потолок под соседом": "Yuqori qo‘shni ostidagi shift",
+    "Потолок / кровля": "Shift / tom",
+    "Наружные стены": "Tashqi devorlar",
+    "Окна": "Derazalar",
+    "Наружные двери": "Tashqi eshiklar",
+}
+_UZ_LINE_PREFIXES = {
+    "Стена: ": "Devor: ",
+    "Мостик: ": "Ko‘prik: ",
+    "Пол по грунту — зона ": "Gruntdagi pol — zona ",
+    "Окна (": "Derazalar (",
+}
+
+
+def _localized_line_text(value: str, locale: str) -> str:
+    if locale != "uz":
+        return value
+    if value in _UZ_LINE_TEXT:
+        return _UZ_LINE_TEXT[value]
+    for source, target in _UZ_LINE_PREFIXES.items():
+        if value.startswith(source):
+            return target + value.removeprefix(source)
+    return value
 
 
 def _font_path() -> Path:
@@ -59,6 +99,15 @@ def build_pdf_report(
     """Return a self-contained, Cyrillic-safe PDF report."""
     _register_fonts()
     created_at = created_at or datetime.now(UTC)
+    local_created_at = created_at.astimezone(ZoneInfo("Asia/Tashkent"))
+    prepared_by = str(answers.get("prepared_by") or "U-Calc")
+    locale = normalize_locale(str(answers.get("locale") or "ru"))
+    locale_label = locale.upper()
+    watts = "Вт" if locale == "ru" else "Vt"
+    kilowatts = "кВт" if locale == "ru" else "kVt"
+    calculation_id = str(
+        answers.get("calculation_id") or answers.get("calculation_request_id") or "unsaved"
+    )
     output = BytesIO()
     document = SimpleDocTemplate(
         output,
@@ -67,8 +116,8 @@ def build_pdf_report(
         leftMargin=16 * mm,
         topMargin=18 * mm,
         bottomMargin=18 * mm,
-        title=f"U-Calc - {answers.get('object_name', 'Расчёт')}",
-        author=f"Telegram user {telegram_user_id}",
+        title=f"U-Calc - {answers.get('object_name', tr('pdf.unnamed', locale))}",
+        author=prepared_by,
     )
     styles = getSampleStyleSheet()
     body = ParagraphStyle(
@@ -97,23 +146,38 @@ def build_pdf_report(
     )
     story = [
         Paragraph("U-CALC", title),
-        Paragraph("Расчёт пиковой тепловой нагрузки", heading),
+        Paragraph(tr("pdf.title", locale), heading),
         Table(
             [
                 [
-                    Paragraph("Объект", small),
-                    Paragraph(escape(str(answers.get("object_name", "Без названия"))), body),
-                ],
-                [
-                    Paragraph("Дата UTC", small),
-                    Paragraph(created_at.isoformat(timespec="minutes"), body),
-                ],
-                [Paragraph("Автор", small), Paragraph(f"Telegram user {telegram_user_id}", body)],
-                [
-                    Paragraph("Версии", small),
+                    Paragraph(tr("pdf.object", locale), small),
                     Paragraph(
-                        f"движок {ENGINE_VERSION}; каталог {CATALOG_VERSION}; "
-                        f"нормы {escape(NORMS_VERSION)}",
+                        escape(str(answers.get("object_name", tr("pdf.unnamed", locale)))), body
+                    ),
+                ],
+                [
+                    Paragraph(tr("pdf.date", locale), small),
+                    Paragraph(local_created_at.strftime("%d.%m.%Y %H:%M"), body),
+                ],
+                [
+                    Paragraph(tr("pdf.prepared_by", locale), small),
+                    Paragraph(escape(prepared_by), body),
+                ],
+                [Paragraph(tr("pdf.language", locale), small), Paragraph(locale_label, body)],
+                [
+                    Paragraph(tr("pdf.calculation_id", locale), small),
+                    Paragraph(escape(calculation_id), body),
+                ],
+                [
+                    Paragraph(tr("pdf.versions", locale), small),
+                    Paragraph(
+                        tr(
+                            "pdf.versions_value",
+                            locale,
+                            engine=ENGINE_VERSION,
+                            catalog=CATALOG_VERSION,
+                            norms=escape(NORMS_VERSION),
+                        ),
                         body,
                     ),
                 ],
@@ -140,19 +204,23 @@ def build_pdf_report(
     reserve_percent = (building.safety_factor - 1) * 100
     story.extend(
         [
-            Paragraph("Результат", heading),
+            Paragraph(tr("pdf.result", locale), heading),
             Table(
                 [
-                    ["Ограждения, проёмы и мостики", f"{result.transmission_w:.0f} Вт"],
-                    ["Вентиляция и инфильтрация", f"{result.ventilation_w:.0f} Вт"],
-                    ["Расчётная нагрузка", f"{result.total_w:.0f} Вт / {result.total_kw:.3f} кВт"],
+                    [tr("pdf.transmission", locale), f"{result.transmission_w:.0f} {watts}"],
+                    [tr("pdf.airflow", locale), f"{result.ventilation_w:.0f} {watts}"],
                     [
-                        f"Рекомендуемая мощность (+{reserve_percent:.0f}%)",
-                        f"{result.recommended_w:.0f} Вт / {result.recommended_kw:.3f} кВт",
+                        tr("pdf.design_load", locale),
+                        f"{result.total_w:.0f} {watts} / {result.total_kw:.3f} {kilowatts}",
                     ],
                     [
-                        "Диапазон подбора без ГВС",
-                        f"{result.total_kw:.2f}-{result.recommended_kw:.2f} кВт",
+                        tr("pdf.recommended", locale, reserve=f"{reserve_percent:.0f}"),
+                        f"{result.recommended_w:.0f} {watts} / "
+                        f"{result.recommended_kw:.3f} {kilowatts}",
+                    ],
+                    [
+                        tr("pdf.selection_range", locale),
+                        f"{result.total_kw:.2f}-{result.recommended_kw:.2f} {kilowatts}",
                     ],
                 ],
                 colWidths=[115 * mm, 60 * mm],
@@ -168,21 +236,21 @@ def build_pdf_report(
                     ]
                 ),
             ),
-            Paragraph(
-                "Проверка суммы: расчётная нагрузка равна сумме всех строк ниже; "
-                "эксплуатационный запас показан отдельно.",
-                small,
-            ),
-            Paragraph("Формулы и построчный расчёт", heading),
-            Paragraph(
-                "Ограждения: Q = U x A x ΔT x (1 + β) x n. Воздушные потери: "
-                "Q = 0,33 x L x ΔT; рекуперация применяется только к механическому потоку. "
-                "Линейные мостики: Q = ψ x L x ΔT.",
-                body,
-            ),
+            Paragraph(tr("pdf.sum_check", locale), small),
+            Paragraph(tr("pdf.formulas", locale), heading),
+            Paragraph(tr("pdf.formulas_text", locale), body),
         ]
     )
-    table_rows = [["Элемент", "Тип", "A / L", "U / ψ", "ΔT", "Q, Вт"]]
+    table_rows = [
+        [
+            tr("pdf.element", locale),
+            tr("pdf.type", locale),
+            "A / L",
+            "U / ψ",
+            "ΔT",
+            f"Q, {watts}",
+        ]
+    ]
     rounded_line_watts: list[Decimal] = []
     quantum = Decimal("0.1")
     for line in result.lines:
@@ -190,8 +258,8 @@ def build_pdf_report(
         rounded_line_watts.append(rounded_watts)
         table_rows.append(
             [
-                Paragraph(escape(line.name), small),
-                Paragraph(escape(line.kind), small),
+                Paragraph(escape(_localized_line_text(line.name, locale)), small),
+                Paragraph(escape(_localized_line_text(line.kind, locale)), small),
                 "-" if line.area_m2 is None else f"{line.area_m2:.2f}",
                 "-" if line.u_value is None else f"{line.u_value:.3f}",
                 f"{line.delta_t_k:.1f}",
@@ -201,8 +269,10 @@ def build_pdf_report(
     rounded_total = Decimal(str(result.total_w)).quantize(quantum, rounding=ROUND_HALF_UP)
     rounding_adjustment = rounded_total - sum(rounded_line_watts, Decimal("0"))
     if rounding_adjustment:
-        table_rows.append(["Поправка округления", "", "", "", "", f"{rounding_adjustment:.1f}"])
-    table_rows.append(["ИТОГО", "", "", "", "", f"{rounded_total:.1f}"])
+        table_rows.append(
+            [tr("pdf.rounding", locale), "", "", "", "", f"{rounding_adjustment:.1f}"]
+        )
+    table_rows.append([tr("pdf.total", locale), "", "", "", "", f"{rounded_total:.1f}"])
     story.append(
         Table(
             table_rows,
@@ -224,20 +294,15 @@ def build_pdf_report(
             ),
         )
     )
-    story.extend([PageBreak(), Paragraph("Полный протокол и источники", heading)])
+    story.extend([PageBreak(), Paragraph(tr("pdf.protocol", locale), heading)])
     for paragraph in bundle.report.split("\n"):
         story.append(Paragraph(escape(paragraph) if paragraph else "&nbsp;", body))
     story.append(
         KeepTogether(
             [
                 Spacer(1, 5 * mm),
-                Paragraph("Ограничение ответственности", heading),
-                Paragraph(
-                    "Отчёт является инженерной оценкой для подбора отопительной мощности, "
-                    "не является официальной проектной документацией и не заменяет проверку "
-                    "лицензированным проектировщиком.",
-                    body,
-                ),
+                Paragraph(tr("pdf.disclaimer_title", locale), heading),
+                Paragraph(tr("pdf.disclaimer", locale), body),
             ]
         )
     )
@@ -246,8 +311,8 @@ def build_pdf_report(
         canvas.saveState()
         canvas.setFont("UCalc", 7)
         canvas.setFillColor(colors.HexColor("#66757A"))
-        canvas.drawString(16 * mm, 9 * mm, "U-Calc - инженерная оценка теплопотерь")
-        canvas.drawRightString(A4[0] - 16 * mm, 9 * mm, f"Страница {doc.page}")
+        canvas.drawString(16 * mm, 9 * mm, tr("pdf.footer", locale))
+        canvas.drawCentredString(A4[0] / 2, 9 * mm, tr("pdf.page", locale, page=doc.page))
         canvas.restoreState()
 
     document.build(story, onFirstPage=footer, onLaterPages=footer)

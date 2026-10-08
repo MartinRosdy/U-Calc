@@ -4,7 +4,7 @@ import math
 from dataclasses import replace
 from typing import Any
 
-from ..calculator import ground_floor_zones
+from ..calculator import ground_floor_zones, orientation_heat_loss_factor
 from ..catalog import CLIMATES, DOORS, MATERIALS, WINDOWS, ClimateProfile, ValueSource
 from ..models import (
     Airflow,
@@ -14,6 +14,7 @@ from ..models import (
     LinearThermalBridge,
     OpaqueSurface,
     Opening,
+    Orientation,
     SurfaceKind,
 )
 
@@ -220,12 +221,18 @@ def assumptions_from_answers(data: dict[str, Any]) -> tuple[str, ...]:
             "поток. Для подбора рекуператора нужен раздельный расход вентиляции и инфильтрации."
         )
     window_groups = data.get("window_groups") or []
-    has_unassigned_windows = any(not group.get("wall_name") for group in window_groups)
-    if data.get("wall_groups") and (
-        not window_groups or has_unassigned_windows or data.get("door_area", 0) > 0
-    ):
+    door_groups = data.get("door_groups") or []
+    has_unassigned_windows = any(not group.get("wall_name") for group in window_groups) or (
+        not window_groups and float(data.get("window_area") or 0) > 0
+    )
+    has_unassigned_doors = any(not group.get("wall_name") for group in door_groups) or (
+        not door_groups and float(data.get("door_area") or 0) > 0
+    )
+    has_unassigned_openings = has_unassigned_windows or has_unassigned_doors
+    if data.get("wall_groups") and has_unassigned_openings:
         assumptions.append(
-            "Непривязанные проёмы распределены между стенами пропорционально свободной площади."
+            "Непривязанные проёмы распределены между стенами пропорционально свободной "
+            "площади; ориентационная добавка для них не определена и принята β=0."
         )
     uses_unheated_estimate = (
         data.get("floor_boundary") == "unheated" and data.get("floor_adjacent_temperature") is None
@@ -340,23 +347,41 @@ def _wall_surfaces(data: dict[str, Any]) -> list[OpaqueSurface]:
         name = _short_name(group, "name", "стены")
         capacity = _mapping_number(group, "gross_area_m2", 0.1, 100_000) - assigned_by_wall[name]
         share = unassigned_opening_area * capacity / remaining_area if remaining_area else 0.0
+        orientation = _orientation(group)
         result.append(
             OpaqueSurface(
                 f"Стена: {name}",
                 capacity - share,
                 _group_layers(group),
                 kind=SurfaceKind.WALL,
+                additional_heat_loss_factor=orientation_heat_loss_factor(orientation),
+                orientation=orientation,
             )
         )
     return result
 
 
+def _orientation(group: dict[str, Any]) -> Orientation | None:
+    value = group.get("orientation")
+    if value in {None, "", "unknown"}:
+        return None
+    try:
+        return Orientation(str(value))
+    except ValueError as exc:
+        raise InvalidCalculationData(f"Неизвестная ориентация стены: {value}") from exc
+
+
 def _openings(data: dict[str, Any]) -> list[Opening]:
     result: list[Opening] = []
+    wall_orientations = {
+        _short_name(group, "name", "стены"): _orientation(group)
+        for group in (data.get("wall_groups") or [])
+    }
     window_groups = data.get("window_groups") or []
     if window_groups:
         for group in window_groups:
             count = int(_mapping_number(group, "count", 1, 500))
+            orientation = wall_orientations.get(group.get("wall_name"))
             result.append(
                 Opening(
                     f"{_short_name(group, 'name', 'окна')} ({count} шт.)",
@@ -364,6 +389,8 @@ def _openings(data: dict[str, Any]) -> list[Opening]:
                     _mapping_number(group, "u_value", 0.1, 10),
                     value_status="passport_user_input",
                     source_note="Паспортный U введён пользователем",
+                    additional_heat_loss_factor=orientation_heat_loss_factor(orientation),
+                    orientation=orientation,
                 )
             )
     else:
@@ -389,6 +416,7 @@ def _openings(data: dict[str, Any]) -> list[Opening]:
     if door_groups:
         for group in door_groups:
             count = int(_mapping_number(group, "count", 1, 100))
+            orientation = wall_orientations.get(group.get("wall_name"))
             result.append(
                 Opening(
                     f"{_short_name(group, 'name', 'двери')} ({count} шт.)",
@@ -396,6 +424,8 @@ def _openings(data: dict[str, Any]) -> list[Opening]:
                     _mapping_number(group, "u_value", 0.1, 10),
                     value_status="passport_user_input",
                     source_note="Паспортный U введён пользователем",
+                    additional_heat_loss_factor=orientation_heat_loss_factor(orientation),
+                    orientation=orientation,
                 )
             )
     else:
@@ -435,6 +465,20 @@ def _wall_layers(data: dict[str, Any]) -> tuple[Layer, ...]:
 
 
 def _group_layers(group: dict[str, Any]) -> tuple[Layer, ...]:
+    explicit_layers = group.get("layers")
+    if explicit_layers is not None:
+        if not isinstance(explicit_layers, list) or not 1 <= len(explicit_layers) <= 10:
+            raise InvalidCalculationData("Конструкция стены должна содержать от 1 до 10 слоёв")
+        if not all(isinstance(item, dict) for item in explicit_layers):
+            raise InvalidCalculationData("Каждый слой стены должен быть объектом")
+        return tuple(
+            _layer(
+                item.get("material"),
+                _mapping_number(item, "thickness_m", 0.001, 2),
+                item.get("material_conductivity"),
+            )
+            for item in explicit_layers
+        )
     layers = [
         _layer(
             group.get("material"),

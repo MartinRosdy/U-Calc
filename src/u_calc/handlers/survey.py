@@ -1,19 +1,17 @@
 import asyncio
-import json
 import logging
 import math
 import secrets
 from dataclasses import asdict
-from datetime import datetime
 
 from aiogram import F, Router
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 from aiogram.types.error_event import ErrorEvent
 
 from ..catalog import CLIMATES, DOORS, MATERIALS, WINDOWS, ClimateProfile
-from ..config import Settings
+from ..i18n import translate as tr
 from ..keyboards import keyboard
 from ..models import Boundary
 from ..parsing import (
@@ -25,6 +23,7 @@ from ..parsing import (
     parse_wall_groups,
     parse_window_groups,
 )
+from ..report import format_telegram_summary
 from ..services.building_factory import InvalidCalculationData, climate_from_answers
 from ..services.calculation_service import calculate_from_answers
 from ..states import Survey
@@ -66,8 +65,18 @@ def _conductivity(text: str) -> float:
     return value
 
 
-async def _error(message: Message, exc: ValueError) -> None:
-    await message.answer(f"⚠️ {exc}. Попробуйте ещё раз.")
+async def _error(message: Message, exc: ValueError, state: FSMContext | None = None) -> None:
+    locale = await _state_locale(state) if state is not None else "ru"
+    detail = str(exc) if locale == "ru" else tr("common.invalid_input", locale)
+    await message.answer(tr("common.retry", locale, message=detail))
+
+
+async def _state_locale(state: FSMContext) -> str:
+    return str((await state.get_data()).get("locale") or "ru")
+
+
+def _material_name(key: str, locale: str) -> str:
+    return tr(f"material.{key}", locale)
 
 
 async def _send_long_message(message: Message, text: str, limit: int = 3900) -> None:
@@ -86,23 +95,24 @@ async def _send_long_message(message: Message, text: str, limit: int = 3900) -> 
 
 async def _ask_wall_material(message: Message, state: FSMContext) -> None:
     await state.set_state(Survey.wall_material)
+    locale = await _state_locale(state)
     keys = ["brick_solid", "brick_hollow", "aerated_d500", "concrete", "wood"]
-    items = [(MATERIALS[key].name, f"mat:{key}") for key in keys]
-    items.append(("Другой материал — паспортная λ", "mat:custom"))
+    items = [(_material_name(key, locale), f"mat:{key}") for key in keys]
+    items.append((tr("survey.wall.material_custom", locale), "mat:custom"))
     await message.answer(
-        "Шаг 4/9 — стены. Основной материал наружных стен:",
-        reply_markup=keyboard(items, 1),
+        tr("survey.wall.material", locale),
+        reply_markup=keyboard(items, 1, locale=locale),
     )
 
 
 async def _ask_windows(message: Message, state: FSMContext) -> None:
     await state.set_state(Survey.window_count)
-    await message.answer("Шаг 5/9 — проёмы. Сколько наружных окон? Если окон нет — 0:")
+    await message.answer(tr("survey.window.count", await _state_locale(state)))
 
 
 async def _ask_doors(message: Message, state: FSMContext) -> None:
     await state.set_state(Survey.door_count)
-    await message.answer("Шаг 5/9 — проёмы. Сколько наружных дверей? Если дверей нет — 0:")
+    await message.answer(tr("survey.door.count", await _state_locale(state)))
 
 
 def _parse_count(text: str) -> int:
@@ -115,18 +125,41 @@ def _parse_count(text: str) -> int:
     return value
 
 
-@router.message(CommandStart())
 @router.message(Command("new"))
-async def start(message: Message, state: FSMContext) -> None:
+async def start(
+    message: Message,
+    state: FSMContext,
+    repository: CalculationRepository | None = None,
+) -> None:
     await state.clear()
+    profile = None
+    locale = "ru"
+    prepared_by = ""
+    if repository is not None:
+        settings = await asyncio.to_thread(repository.get_user_settings, message.from_user.id)
+        locale = settings.locale
+        prepared_by = settings.prepared_by
+        if settings.default_profile_id is not None:
+            profile = await asyncio.to_thread(
+                repository.get_profile,
+                message.from_user.id,
+                settings.default_profile_id,
+            )
+    await state.update_data(
+        locale=locale,
+        prepared_by=prepared_by,
+        profile_defaults=dict(profile.settings) if profile else {},
+        applied_profile_id=profile.id if profile else None,
+        applied_profile_name=profile.name if profile else None,
+    )
     await state.set_state(Survey.calculation_mode)
+    profile_note = tr("survey.profile_applied", locale, name=profile.name) if profile else ""
     await message.answer(
-        "🏠 U-Calc рассчитает пиковые теплопотери и покажет, куда уходит тепло.\n\n"
-        "Выберите уровень детализации:",
+        tr("survey.start", locale, profile_note=profile_note),
         reply_markup=keyboard(
             [
-                ("Быстрый расчёт", "mode:quick"),
-                ("Расширенный расчёт", "mode:advanced"),
+                (tr("survey.mode.quick", locale), "mode:quick"),
+                (tr("survey.mode.advanced", locale), "mode:advanced"),
             ],
             1,
             navigation=False,
@@ -134,54 +167,60 @@ async def start(message: Message, state: FSMContext) -> None:
     )
 
 
+async def _ask_indoor(message: Message, state: FSMContext, outdoor: float) -> None:
+    data = await state.get_data()
+    locale = str(data.get("locale") or "ru")
+    defaults = data.get("profile_defaults", {})
+    items: list[tuple[str, str]] = []
+    try:
+        default = float(defaults["indoor"])
+    except (KeyError, TypeError, ValueError):
+        default = math.nan
+    if math.isfinite(default) and outdoor < default <= 35:
+        items.append(
+            (
+                tr("survey.from_profile_temperature", locale, temperature=f"{default:g}"),
+                f"profile_indoor:{default:g}",
+            )
+        )
+    await state.set_state(Survey.indoor)
+    await message.answer(
+        tr("survey.indoor", locale, outdoor=f"{outdoor:g}"),
+        reply_markup=keyboard(items, 1, locale=locale) if items else None,
+    )
+
+
+async def _accept_indoor(message: Message, state: FSMContext, value: float) -> None:
+    data = await state.get_data()
+    if value <= data["outdoor"]:
+        raise ValueError("внутренняя температура должна быть выше наружной")
+    await state.update_data(indoor=value)
+    await state.set_state(Survey.dimensions)
+    await message.answer(tr("survey.dimensions", await _state_locale(state)))
+
+
 @router.callback_query(Survey.calculation_mode, F.data.startswith("mode:"))
 async def calculation_mode(callback: CallbackQuery, state: FSMContext) -> None:
     mode = callback.data.split(":", 1)[1]
     if mode not in {"quick", "advanced"}:
-        await callback.answer("Неизвестный режим", show_alert=True)
+        await callback.answer(
+            tr("common.invalid_option", await _state_locale(state)), show_alert=True
+        )
         return
     await state.update_data(calculation_mode=mode)
     await state.set_state(Survey.building_type)
+    locale = await _state_locale(state)
     await callback.message.answer(
-        "Шаг 1/9 — объект. Что рассчитываем?",
-        reply_markup=keyboard([("Квартиру", "type:apartment"), ("Частный дом", "type:house")]),
+        tr("survey.object.question", locale),
+        reply_markup=keyboard(
+            [
+                (tr("survey.object.apartment", locale), "type:apartment"),
+                (tr("survey.object.house", locale), "type:house"),
+            ],
+            locale=locale,
+        ),
     )
     await callback.answer()
-
-
-@router.message(Command("help"))
-async def help_command(message: Message) -> None:
-    await message.answer(
-        "Команды:\n/new — новый расчёт\n/history — последние расчёты\n"
-        "/report N — открыть сохранённый расчёт №N\n"
-        "/delete_history — удалить свою историю\n/resume — продолжить черновик\n"
-        "/discard_draft — удалить черновик\n/copy N — копировать расчёт\n"
-        "/compare N M — сравнить две версии\n"
-        "/back — предыдущий шаг\n/cancel — отменить\n/help — справка\n\n"
-        "Бот считает Q = U × A × ΔT для ограждений и 0,33 × n × V × ΔT для воздухообмена. "
-        "Результат — требуемая мощность в расчётный мороз, а не месячное потребление."
-    )
-
-
-@router.message(Command("history"))
-async def history(message: Message, repository: CalculationRepository, settings: Settings) -> None:
-    records = await asyncio.to_thread(repository.recent, message.from_user.id, 5)
-    if not records:
-        await message.answer("История пока пуста. Начните расчёт командой /new")
-        return
-    lines = ["🗂 Последние расчёты:"]
-    for record in records:
-        created = (
-            datetime.fromisoformat(record.created_at)
-            .astimezone(settings.timezone)
-            .strftime("%d.%m.%Y %H:%M")
-        )
-        kind = "квартира" if record.building_type == "apartment" else "дом"
-        lines.append(
-            f"• №{record.id} · {created} · {kind} · {record.object_name} "
-            f"v{record.calculation_version} · {record.recommended_kw:.2f} кВт с запасом"
-        )
-    await message.answer("\n".join(lines))
 
 
 @router.message(Command("resume"))
@@ -190,113 +229,31 @@ async def resume_draft(
 ) -> None:
     draft = await asyncio.to_thread(repository.load_draft, message.from_user.id)
     if draft is None:
-        await message.answer("Сохранённого черновика нет. Начать новый: /new")
+        await message.answer(tr("survey.draft_missing", await _state_locale(state)))
         return
     await state.set_data(draft.data)
     await state.set_state(draft.current_step)
-    await message.answer(
-        "Черновик восстановлен. Можно ответить на последний вопрос или нажать старую "
-        "кнопку в диалоге. Для возврата используйте /back; удалить черновик — /discard_draft."
-    )
+    await message.answer(tr("survey.draft_restored", await _state_locale(state)))
+    await _render_current_step(message, state)
 
 
 @router.message(Command("discard_draft"))
 async def discard_draft(
     message: Message, state: FSMContext, repository: CalculationRepository
 ) -> None:
+    locale = await _state_locale(state)
     await state.clear()
     deleted = await asyncio.to_thread(repository.delete_draft, message.from_user.id)
-    await message.answer("Черновик удалён." if deleted else "Сохранённого черновика нет.")
-
-
-@router.message(Command("copy"))
-async def copy_calculation(
-    message: Message, state: FSMContext, repository: CalculationRepository
-) -> None:
-    parts = (message.text or "").split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        await message.answer("Укажите номер: /copy 12")
-        return
-    data = await asyncio.to_thread(
-        repository.copy_answers_for_user, message.from_user.id, int(parts[1])
-    )
-    if data is None:
-        await message.answer("Расчёт не найден в вашей истории.")
-        return
-    await state.set_data(data)
-    await _ask_confirmation(message, state)
-
-
-@router.message(Command("compare"))
-async def compare_calculations(message: Message, repository: CalculationRepository) -> None:
-    parts = (message.text or "").split()
-    if len(parts) != 3 or not all(item.isdigit() for item in parts[1:]):
-        await message.answer("Укажите два номера: /compare 12 15")
-        return
-    differences = await asyncio.to_thread(
-        repository.compare_for_user,
-        message.from_user.id,
-        int(parts[1]),
-        int(parts[2]),
-    )
-    if differences is None:
-        await message.answer("Один из расчётов не найден в вашей истории.")
-        return
-    if not differences:
-        await message.answer("Исходные данные этих версий совпадают.")
-        return
-    lines = ["Изменённые исходные данные:"]
-    for key, (before, after) in list(differences.items())[:40]:
-        lines.append(f"• {key}: {before!s:.80} → {after!s:.80}")
-    await _send_long_message(message, "\n".join(lines))
-
-
-@router.message(Command("report"))
-async def saved_report(message: Message, repository: CalculationRepository) -> None:
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) != 2 or not parts[1].strip().isdigit():
-        await message.answer("Укажите номер: /report 12")
-        return
-    calculation_id = int(parts[1].strip())
-    record = await asyncio.to_thread(repository.get_for_user, message.from_user.id, calculation_id)
-    if record is None:
-        await message.answer("Расчёт с таким номером не найден в вашей истории.")
-        return
-    await _send_long_message(message, f"Расчёт №{record.id}\n\n{record.report}")
-
-
-@router.message(Command("delete_history"))
-async def delete_history_prompt(message: Message) -> None:
     await message.answer(
-        "Удалить все ваши сохранённые расчёты? Это действие нельзя отменить.",
-        reply_markup=keyboard(
-            [
-                ("Да, удалить", "delete_history:confirm"),
-                ("Отмена", "delete_history:cancel"),
-            ],
-            1,
-        ),
+        tr("survey.draft_deleted", locale) if deleted else tr("survey.draft_missing", locale)
     )
-
-
-@router.callback_query(F.data.startswith("delete_history:"))
-async def delete_history(callback: CallbackQuery, repository: CalculationRepository) -> None:
-    action = callback.data.split(":", 1)[1]
-    if action == "cancel":
-        await callback.message.answer("Удаление отменено.")
-    elif action == "confirm":
-        deleted = await asyncio.to_thread(repository.delete_for_user, callback.from_user.id)
-        await callback.message.answer(f"Удалено расчётов: {deleted}.")
-    else:
-        await callback.answer("Неизвестное действие", show_alert=True)
-        return
-    await callback.answer()
 
 
 @router.message(Command("cancel"))
 async def cancel(message: Message, state: FSMContext) -> None:
+    locale = await _state_locale(state)
     await state.clear()
-    await message.answer("Расчёт отменён. Чтобы начать заново: /new")
+    await message.answer(tr("survey.cancelled", locale))
 
 
 async def _go_back(state: FSMContext) -> bool:
@@ -312,32 +269,146 @@ async def _go_back(state: FSMContext) -> bool:
     return True
 
 
+async def _current_state_name(state: FSMContext) -> str | None:
+    getter = getattr(state, "get_state", None)
+    if getter is not None:
+        return await getter()
+    value = getattr(state, "state", None)
+    return getattr(value, "state", value)
+
+
+async def _render_current_step(message: Message, state: FSMContext) -> None:
+    """Render a fresh prompt after back/resume instead of relying on old messages."""
+    from .bridge_editor import render_editor_step as render_bridge_editor_step
+    from .opening_editor import render_editor_step
+    from .wall_editor import render_editor_step as render_wall_editor_step
+
+    if await render_editor_step(message, state):
+        return
+    if await render_bridge_editor_step(message, state):
+        return
+    if await render_wall_editor_step(message, state):
+        return
+    current = await _current_state_name(state)
+    data = await state.get_data()
+    locale = str(data.get("locale") or "ru")
+    if current == Survey.calculation_mode.state:
+        await message.answer(
+            tr("survey.start", locale, profile_note=""),
+            reply_markup=keyboard(
+                [
+                    (tr("survey.mode.quick", locale), "mode:quick"),
+                    (tr("survey.mode.advanced", locale), "mode:advanced"),
+                ],
+                1,
+                navigation=False,
+            ),
+        )
+        return
+    if current == Survey.building_type.state:
+        await message.answer(
+            tr("survey.object.question", locale),
+            reply_markup=keyboard(
+                [
+                    (tr("survey.object.apartment", locale), "type:apartment"),
+                    (tr("survey.object.house", locale), "type:house"),
+                ]
+            ),
+        )
+        return
+    if current == Survey.apartment_position.state:
+        await _ask_apartment_position(message, state)
+        return
+    if current == Survey.climate.state:
+        await _ask_climate(message, state)
+        return
+    if current == Survey.scenario.state:
+        profile = climate_from_answers(data)
+        if profile is not None:
+            await _ask_scenario(message, state, profile)
+            return
+    if current == Survey.indoor.state and "outdoor" in data:
+        await _ask_indoor(message, state, float(data["outdoor"]))
+        return
+    if current == Survey.wall_method.state:
+        await _ask_wall_method(message, state)
+        return
+    if current == Survey.air_changes.state:
+        await _ask_air_changes(message, state)
+        return
+    if current == Survey.safety_factor.state:
+        await _ask_safety_factor(message, state)
+        return
+    if current == Survey.confirmation.state:
+        await _ask_confirmation(message, state)
+        return
+    prompts = {
+        Survey.object_name.state: tr("survey.object_name", locale),
+        Survey.custom_outdoor.state: tr("survey.outdoor_manual", locale),
+        Survey.custom_city_name.state: tr("survey.city_name", locale),
+        Survey.custom_cold_mean.state: tr("survey.custom.cold_mean", locale),
+        Survey.custom_design.state: tr("survey.custom.design", locale),
+        Survey.custom_extreme.state: tr("survey.custom.extreme", locale),
+        Survey.custom_hot_mean.state: tr("survey.custom.hot_mean", locale),
+        Survey.custom_hot_max.state: tr("survey.custom.hot_max", locale),
+        Survey.dimensions.state: tr("survey.dimensions", locale),
+        Survey.wall_area.state: tr("survey.wall.area", locale),
+        Survey.wall_dimensions.state: tr("survey.wall.dimensions", locale),
+        Survey.wall_thickness.state: "Введите толщину материала стены в сантиметрах:",
+        Survey.wall_editor_name.state: "Название стены или группы (до 60 символов):",
+        Survey.wall_editor_area.state: "Площадь стены либо ширина×высота:",
+        Survey.wall_editor_custom_lambda.state: "Паспортная λ материала, Вт/(м·К):",
+        Survey.wall_editor_thickness.state: "Толщина основного материала, см:",
+        Survey.wall_editor_insulation_custom_lambda.state: ("Паспортная λ утеплителя, Вт/(м·К):"),
+        Survey.wall_editor_insulation_thickness.state: "Толщина утеплителя, см:",
+        Survey.wall_editor_more_layers.state: (
+            "Добавьте следующий слой конструкции или завершите стену кнопкой выше."
+        ),
+        Survey.insulation_thickness.state: "Введите толщину утеплителя в сантиметрах:",
+        Survey.window_count.state: "Сколько наружных окон? Если окон нет — 0:",
+        Survey.door_count.state: "Сколько наружных дверей? Если дверей нет — 0:",
+        Survey.mechanical_ventilation.state: "Введите расход механической вентиляции:",
+        Survey.natural_ventilation.state: "Введите расход естественной вентиляции:",
+        Survey.infiltration.state: "Введите расчётную инфильтрацию:",
+        Survey.heat_recovery_efficiency.state: "Паспортный КПД рекуператора, %:",
+        Survey.thermal_bridge_details.state: (
+            "Введите мостики холода строками: название | длина | ψ"
+        ),
+    }
+    await message.answer(
+        prompts.get(
+            current,
+            tr("survey.resume_fallback", locale),
+        )
+    )
+
+
 @router.message(Command("back"))
 async def back_command(message: Message, state: FSMContext) -> None:
+    locale = await _state_locale(state)
     if await _go_back(state):
-        await message.answer(
-            "⬅️ Вернулись к предыдущему шагу. Введите новое значение или выберите "
-            "вариант на предыдущей клавиатуре."
-        )
+        await message.answer(tr("survey.back_restored", locale))
+        await _render_current_step(message, state)
     else:
-        await message.answer("Предыдущего шага нет. Начать расчёт: /new")
+        await message.answer(tr("survey.back_missing", locale))
 
 
 @router.callback_query(F.data == "nav:back")
 async def back_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    locale = await _state_locale(state)
     if await _go_back(state):
-        await callback.message.answer(
-            "⬅️ Вернулись к предыдущему шагу. Измените ответ на предыдущей клавиатуре."
-        )
+        await callback.message.answer(tr("survey.back_restored", locale))
+        await _render_current_step(callback.message, state)
         await callback.answer()
     else:
-        await callback.answer("Предыдущего шага нет", show_alert=True)
+        await callback.answer(tr("survey.back_missing_alert", locale), show_alert=True)
 
 
 @router.callback_query(F.data == "nav:cancel")
 async def cancel_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    locale = await _state_locale(state)
     await state.clear()
-    await callback.message.answer("Расчёт отменён. Чтобы начать заново: /new")
+    await callback.message.answer(tr("survey.cancelled", locale))
     await callback.answer()
 
 
@@ -345,24 +416,13 @@ async def cancel_callback(callback: CallbackQuery, state: FSMContext) -> None:
 async def building_type(callback: CallbackQuery, state: FSMContext) -> None:
     kind = callback.data.split(":", 1)[1]
     if kind not in {"apartment", "house"}:
-        await callback.answer("Неизвестный тип объекта", show_alert=True)
+        await callback.answer(
+            tr("common.invalid_option", await _state_locale(state)), show_alert=True
+        )
         return
     await state.update_data(building_type=kind)
     if kind == "apartment":
-        await state.set_state(Survey.apartment_position)
-        await callback.message.answer(
-            "Где расположена квартира? Перекрытия с отапливаемыми соседями "
-            "будут автоматически исключены.",
-            reply_markup=keyboard(
-                [
-                    ("Средний этаж", "position:middle"),
-                    ("Первый этаж", "position:first"),
-                    ("Последний этаж", "position:last"),
-                    ("Первый и последний", "position:first_last"),
-                ],
-                1,
-            ),
-        )
+        await _ask_apartment_position(callback.message, state)
         await callback.answer()
         return
     await state.update_data(apartment_position=None)
@@ -370,28 +430,50 @@ async def building_type(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
+async def _ask_apartment_position(message: Message, state: FSMContext) -> None:
+    locale = await _state_locale(state)
+    await state.set_state(Survey.apartment_position)
+    await message.answer(
+        tr("survey.position.question", locale),
+        reply_markup=keyboard(
+            [
+                (tr("survey.position.middle", locale), "position:middle"),
+                (tr("survey.position.first", locale), "position:first"),
+                (tr("survey.position.last", locale), "position:last"),
+                (tr("survey.position.first_last", locale), "position:first_last"),
+            ],
+            1,
+            locale=locale,
+        ),
+    )
+
+
 async def _ask_climate(message: Message, state: FSMContext) -> None:
     await state.set_state(Survey.climate)
-    items = [(profile.name, f"climate:{key}") for key, profile in CLIMATES.items()]
+    locale = await _state_locale(state)
+    items = [(tr(f"climate.{key}", locale), f"climate:{key}") for key in CLIMATES]
     items.extend(
         [
-            ("Другой город (полный профиль)", "climate:custom"),
-            ("Только температура вручную", "climate:manual"),
+            (tr("survey.climate.custom", locale), "climate:custom"),
+            (tr("survey.climate.manual", locale), "climate:manual"),
         ]
     )
-    await message.answer("Шаг 2/9 — климат. Выберите профиль:", reply_markup=keyboard(items, 1))
+    await message.answer(
+        tr("survey.climate.question", locale),
+        reply_markup=keyboard(items, 1, locale=locale),
+    )
 
 
 async def _ask_object_name(message: Message, state: FSMContext) -> None:
     await state.set_state(Survey.object_name)
-    await message.answer("Название объекта для истории и версий, например «Дом Юнусабад»: ")
+    await message.answer(tr("survey.object_name", await _state_locale(state)))
 
 
 @router.message(Survey.object_name)
 async def object_name(message: Message, state: FSMContext) -> None:
     value = (message.text or "").strip()
     if not 1 <= len(value) <= 120:
-        await message.answer("Название должно содержать от 1 до 120 символов.")
+        await _error(message, ValueError("название должно содержать от 1 до 120 символов"), state)
         return
     await state.update_data(object_name=value)
     await _ask_climate(message, state)
@@ -401,7 +483,9 @@ async def object_name(message: Message, state: FSMContext) -> None:
 async def apartment_position(callback: CallbackQuery, state: FSMContext) -> None:
     position = callback.data.split(":", 1)[1]
     if position not in {"middle", "first", "last", "first_last"}:
-        await callback.answer("Неизвестное положение квартиры", show_alert=True)
+        await callback.answer(
+            tr("common.invalid_option", await _state_locale(state)), show_alert=True
+        )
         return
     await state.update_data(apartment_position=position)
     await _ask_object_name(callback.message, state)
@@ -412,17 +496,17 @@ async def apartment_position(callback: CallbackQuery, state: FSMContext) -> None
 async def climate(callback: CallbackQuery, state: FSMContext) -> None:
     climate_key = callback.data.split(":", 1)[1]
     if climate_key not in {*CLIMATES, "manual", "custom"}:
-        await callback.answer("Неизвестный климат", show_alert=True)
+        await callback.answer(
+            tr("common.invalid_option", await _state_locale(state)), show_alert=True
+        )
         return
     await state.update_data(climate_key=climate_key)
     if climate_key == "manual":
         await state.set_state(Survey.custom_outdoor)
-        await callback.message.answer(
-            "Введите расчётную наружную температуру зимой, °C (например -18):"
-        )
+        await callback.message.answer(tr("survey.outdoor_manual", await _state_locale(state)))
     elif climate_key == "custom":
         await state.set_state(Survey.custom_city_name)
-        await callback.message.answer("Название города или населённого пункта:")
+        await callback.message.answer(tr("survey.city_name", await _state_locale(state)))
     else:
         profile = CLIMATES[climate_key]
         await _ask_scenario(callback.message, state, profile)
@@ -431,34 +515,40 @@ async def climate(callback: CallbackQuery, state: FSMContext) -> None:
 
 async def _ask_scenario(message: Message, state: FSMContext, profile: "ClimateProfile") -> None:
     if profile.design_c is None:
+        locale = await _state_locale(state)
         await state.set_state(Survey.profile_design)
-        await message.answer(
-            f"Для {profile.name} среднемесячные и экстремальные температуры подтверждены "
-            "таблицей 1 ШНҚ 2.01.01-22, но прежнее встроенное значение расчётного "
-            "мороза не имело однозначной ссылки на таблицу 4.\n\n"
-            "Введите подтверждённую для объекта температуру параметра Б, °C "
-            "(наиболее холодная пятидневка обеспеченностью 0,92):"
-        )
+        data = await state.get_data()
+        climate_key = str(data.get("climate_key") or "")
+        city = tr(f"climate.{climate_key}", locale) if climate_key in CLIMATES else profile.name
+        await message.answer(tr("survey.profile_design", locale, city=city))
         return
     await state.set_state(Survey.scenario)
+    locale = await _state_locale(state)
+    data = await state.get_data()
     await message.answer(
-        f"Шаг 2/9 — климат. {profile.name}: выберите режим расчёта.\n"
-        f"Средний холодный месяц {profile.cold_month_mean_c:g} °C; "
-        f"расчётный мороз {profile.design_c:g} °C; "
-        f"наблюдавшийся экстремум {profile.observed_extreme_c:g} °C.\n"
-        f"Для справки о лете: средний жаркий месяц {profile.hot_month_mean_c:g} °C, "
-        f"абсолютный максимум {profile.observed_maximum_c:g} °C. "
-        "Летние значения в нагрузку отопления не входят.\n"
-        "Климатический резерв — стресс-сценарий на 2 °C холоднее расчётного, "
-        "а не прогноз конкретной погоды.",
+        tr(
+            "survey.scenario.question",
+            locale,
+            city=(
+                tr(f"climate.{data['climate_key']}", locale)
+                if data.get("climate_key") in CLIMATES
+                else profile.name
+            ),
+            cold=f"{profile.cold_month_mean_c:g}",
+            design=f"{profile.design_c:g}",
+            extreme=f"{profile.observed_extreme_c:g}",
+            hot=f"{profile.hot_month_mean_c:g}",
+            maximum=f"{profile.observed_maximum_c:g}",
+        ),
         reply_markup=keyboard(
             [
-                ("Обычная зима", "scenario:economy"),
-                ("Расчётный мороз", "scenario:design"),
-                ("Экстремум", "scenario:extreme"),
-                ("Климатический резерв", "scenario:future"),
+                (tr("survey.scenario.economy", locale), "scenario:economy"),
+                (tr("survey.scenario.design", locale), "scenario:design"),
+                (tr("survey.scenario.extreme", locale), "scenario:extreme"),
+                (tr("survey.scenario.future", locale), "scenario:future"),
             ],
             1,
+            locale=locale,
         ),
     )
 
@@ -474,12 +564,12 @@ async def profile_design(message: Message, state: FSMContext) -> None:
         if value < profile.observed_extreme_c:
             raise ValueError("расчётная температура не может быть ниже абсолютного минимума")
     except (KeyError, ValueError) as exc:
-        await _error(message, ValueError(str(exc)))
+        await _error(message, ValueError(str(exc)), state)
         return
     await state.update_data(confirmed_design_c=value)
     confirmed = climate_from_answers(await state.get_data())
     if confirmed is None:
-        await _error(message, ValueError("не удалось подтвердить климатический профиль"))
+        await _error(message, ValueError("не удалось подтвердить климатический профиль"), state)
         return
     await _ask_scenario(message, state, confirmed)
 
@@ -490,19 +580,19 @@ async def scenario(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     profile = climate_from_answers(data)
     if profile is None:
-        await callback.answer("Климатический профиль не найден", show_alert=True)
+        await callback.answer(
+            tr("common.invalid_option", await _state_locale(state)), show_alert=True
+        )
         return
     try:
         outdoor = profile.outdoor_temperature(scenario_key)
     except ValueError:
-        await callback.answer("Неизвестный климатический сценарий", show_alert=True)
+        await callback.answer(
+            tr("common.invalid_option", await _state_locale(state)), show_alert=True
+        )
         return
     await state.update_data(scenario=scenario_key, outdoor=outdoor)
-    await state.set_state(Survey.indoor)
-    await callback.message.answer(
-        f"Шаг 3/9 — температура. Снаружи {outdoor:g} °C. "
-        "Какая температура нужна внутри, °C? Например 24"
-    )
+    await _ask_indoor(callback.message, state, outdoor)
     await callback.answer()
 
 
@@ -513,22 +603,21 @@ async def custom_outdoor(message: Message, state: FSMContext) -> None:
         if outdoor > 15:
             raise ValueError("для отопления ожидается температура не выше +15 °C")
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
         return
     await state.update_data(outdoor=outdoor, scenario="manual")
-    await state.set_state(Survey.indoor)
-    await message.answer("Шаг 3/9 — температура внутри, °C. Например 24:")
+    await _ask_indoor(message, state, outdoor)
 
 
 @router.message(Survey.custom_city_name)
 async def custom_city_name(message: Message, state: FSMContext) -> None:
     name = (message.text or "").strip()
     if not 2 <= len(name) <= 80:
-        await _error(message, ValueError("название должно содержать от 2 до 80 символов"))
+        await _error(message, ValueError("название должно содержать от 2 до 80 символов"), state)
         return
     await state.update_data(custom_city_name=name)
     await state.set_state(Survey.custom_cold_mean)
-    await message.answer("Средняя температура самого холодного месяца, °C:")
+    await message.answer(tr("survey.custom.cold_mean", await _state_locale(state)))
 
 
 @router.message(Survey.custom_cold_mean)
@@ -536,11 +625,11 @@ async def custom_cold_mean(message: Message, state: FSMContext) -> None:
     try:
         value = _temperature(message.text)
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
         return
     await state.update_data(custom_cold_mean=value)
     await state.set_state(Survey.custom_design)
-    await message.answer("Расчётная зимняя температура для отопления, °C:")
+    await message.answer(tr("survey.custom.design", await _state_locale(state)))
 
 
 @router.message(Survey.custom_design)
@@ -551,11 +640,11 @@ async def custom_design(message: Message, state: FSMContext) -> None:
         if value >= data["custom_cold_mean"]:
             raise ValueError("расчётный мороз должен быть холоднее среднемесячной температуры")
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
         return
     await state.update_data(custom_design=value)
     await state.set_state(Survey.custom_extreme)
-    await message.answer("Абсолютный наблюдавшийся минимум, °C:")
+    await message.answer(tr("survey.custom.extreme", await _state_locale(state)))
 
 
 @router.message(Survey.custom_extreme)
@@ -566,11 +655,11 @@ async def custom_extreme(message: Message, state: FSMContext) -> None:
         if value > data["custom_design"]:
             raise ValueError("рекордный минимум не может быть теплее расчётного мороза")
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
         return
     await state.update_data(custom_extreme=value)
     await state.set_state(Survey.custom_hot_mean)
-    await message.answer("Средняя температура самого жаркого месяца, °C:")
+    await message.answer(tr("survey.custom.hot_mean", await _state_locale(state)))
 
 
 @router.message(Survey.custom_hot_mean)
@@ -578,11 +667,11 @@ async def custom_hot_mean(message: Message, state: FSMContext) -> None:
     try:
         value = _temperature(message.text)
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
         return
     await state.update_data(custom_hot_mean=value)
     await state.set_state(Survey.custom_hot_max)
-    await message.answer("Абсолютный наблюдавшийся максимум, °C:")
+    await message.answer(tr("survey.custom.hot_max", await _state_locale(state)))
 
 
 @router.message(Survey.custom_hot_max)
@@ -593,13 +682,13 @@ async def custom_hot_max(message: Message, state: FSMContext) -> None:
         if value < data["custom_hot_mean"]:
             raise ValueError("абсолютный максимум не может быть ниже среднего жаркого месяца")
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
         return
     await state.update_data(custom_hot_max=value)
     data = await state.get_data()
     profile = climate_from_answers(data)
     if profile is None:  # Defensive guard for corrupted FSM data.
-        await _error(message, ValueError("не удалось собрать климатический профиль"))
+        await _error(message, ValueError("не удалось собрать климатический профиль"), state)
         return
     await _ask_scenario(message, state, profile)
 
@@ -608,15 +697,20 @@ async def custom_hot_max(message: Message, state: FSMContext) -> None:
 async def indoor(message: Message, state: FSMContext) -> None:
     try:
         value = parse_number(message.text)
-        data = await state.get_data()
-        if value <= data["outdoor"]:
-            raise ValueError("внутренняя температура должна быть выше наружной")
+        await _accept_indoor(message, state, value)
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
+
+
+@router.callback_query(Survey.indoor, F.data.startswith("profile_indoor:"))
+async def profile_indoor(callback: CallbackQuery, state: FSMContext) -> None:
+    try:
+        value = float(callback.data.split(":", 1)[1])
+        await _accept_indoor(callback.message, state, value)
+    except (IndexError, ValueError, KeyError) as exc:
+        await callback.answer(str(exc) or "Некорректная температура", show_alert=True)
         return
-    await state.update_data(indoor=value)
-    await state.set_state(Survey.dimensions)
-    await message.answer("Шаг 4/9 — геометрия. Введите длину, ширину и высоту, м: 10 8 3")
+    await callback.answer()
 
 
 @router.message(Survey.dimensions)
@@ -624,22 +718,29 @@ async def dimensions(message: Message, state: FSMContext) -> None:
     try:
         length, width, height = parse_triplet(message.text)
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
         return
     await state.update_data(
         length=length, width=width, height=height, volume=length * width * height
     )
+    await _ask_wall_method(message, state)
+
+
+async def _ask_wall_method(message: Message, state: FSMContext) -> None:
+    locale = await _state_locale(state)
     await state.set_state(Survey.wall_method)
     await message.answer(
-        "Шаг 4/9 — стены. Как задать только наружные холодные стены?",
+        tr("survey.wall_method.question", locale),
         reply_markup=keyboard(
             [
-                ("Общей площадью", "walls:area"),
-                ("Размер каждой стены", "walls:dimensions"),
-                ("Весь периметр", "walls:perimeter"),
-                ("Разные конструкции", "walls:groups"),
+                (tr("survey.wall_method.area", locale), "walls:area"),
+                (tr("survey.wall_method.dimensions", locale), "walls:dimensions"),
+                (tr("survey.wall_method.perimeter", locale), "walls:perimeter"),
+                (tr("survey.wall_method.editor", locale), "walls:editor"),
+                (tr("survey.wall_method.import", locale), "walls:groups"),
             ],
             1,
+            locale=locale,
         ),
     )
 
@@ -647,17 +748,21 @@ async def dimensions(message: Message, state: FSMContext) -> None:
 @router.callback_query(Survey.wall_method, F.data.startswith("walls:"))
 async def wall_method(callback: CallbackQuery, state: FSMContext) -> None:
     method = callback.data.split(":", 1)[1]
-    if method not in {"area", "dimensions", "groups", "perimeter"}:
-        await callback.answer("Неизвестный способ ввода стен", show_alert=True)
+    if method not in {"area", "dimensions", "editor", "groups", "perimeter"}:
+        await callback.answer(
+            tr("common.invalid_option", await _state_locale(state)), show_alert=True
+        )
         return
     if method == "area":
         await state.set_state(Survey.wall_area)
-        await callback.message.answer(
-            "Введите общую площадь наружных стен до вычета окон и дверей, м²:"
-        )
+        await callback.message.answer(tr("survey.wall.area", await _state_locale(state)))
     elif method == "dimensions":
         await state.set_state(Survey.wall_dimensions)
-        await callback.message.answer("Введите ширину×высоту каждой стены: 5x3, 4x3")
+        await callback.message.answer(tr("survey.wall.dimensions", await _state_locale(state)))
+    elif method == "editor":
+        from .wall_editor import start_editor
+
+        await start_editor(callback.message, state)
     elif method == "groups":
         await state.set_state(Survey.wall_groups)
         await callback.message.answer(
@@ -684,7 +789,7 @@ async def wall_area(message: Message, state: FSMContext) -> None:
     try:
         area = parse_number(message.text)
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
         return
     await state.update_data(wall_gross_area=area)
     await _ask_wall_material(message, state)
@@ -695,7 +800,7 @@ async def wall_dimensions(message: Message, state: FSMContext) -> None:
     try:
         area = sum(width * height for width, height in parse_dimensions(message.text))
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
         return
     await state.update_data(wall_gross_area=area)
     await _ask_wall_material(message, state)
@@ -706,7 +811,7 @@ async def wall_groups(message: Message, state: FSMContext) -> None:
     try:
         groups = parse_wall_groups(message.text)
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
         return
     await state.update_data(
         wall_groups=groups,
@@ -722,18 +827,21 @@ async def wall_groups(message: Message, state: FSMContext) -> None:
 @router.callback_query(Survey.wall_material, F.data.startswith("mat:"))
 async def wall_material(callback: CallbackQuery, state: FSMContext) -> None:
     key = callback.data.split(":", 1)[1]
+    locale = await _state_locale(state)
     if key == "custom":
         await state.set_state(Survey.wall_custom_lambda)
-        await callback.message.answer("Паспортная теплопроводность материала λ, Вт/(м·К):")
+        await callback.message.answer(tr("survey.wall.custom_lambda", locale))
         await callback.answer()
         return
     if key not in MATERIALS:
-        await callback.answer("Неизвестный материал", show_alert=True)
+        await callback.answer(
+            tr("common.invalid_option", await _state_locale(state)), show_alert=True
+        )
         return
     await state.update_data(wall_material=key)
     await state.set_state(Survey.wall_thickness)
     await callback.message.answer(
-        f"Толщина слоя «{MATERIALS[key].name}» в сантиметрах, например 25:"
+        tr("survey.wall.thickness", locale, material=_material_name(key, locale))
     )
     await callback.answer()
 
@@ -743,11 +851,11 @@ async def wall_custom_lambda(message: Message, state: FSMContext) -> None:
     try:
         value = _conductivity(message.text)
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
         return
     await state.update_data(wall_material="custom", wall_conductivity=value)
     await state.set_state(Survey.wall_thickness)
-    await message.answer("Толщина этого материала в сантиметрах:")
+    await message.answer(tr("survey.wall.custom_thickness", await _state_locale(state)))
 
 
 @router.message(Survey.wall_thickness)
@@ -755,31 +863,39 @@ async def wall_thickness(message: Message, state: FSMContext) -> None:
     try:
         value = parse_number(message.text)
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
         return
     await state.update_data(wall_thickness=value / 100)
     await state.set_state(Survey.insulated)
+    locale = await _state_locale(state)
     await message.answer(
-        "Стена утеплена?", reply_markup=keyboard([("Да", "ins:yes"), ("Нет", "ins:no")])
+        tr("survey.wall.insulated", locale),
+        reply_markup=keyboard(
+            [(tr("common.yes", locale), "ins:yes"), (tr("common.no", locale), "ins:no")],
+            locale=locale,
+        ),
     )
 
 
 @router.callback_query(Survey.insulated, F.data.startswith("ins:"))
 async def insulated(callback: CallbackQuery, state: FSMContext) -> None:
     if callback.data not in {"ins:yes", "ins:no"}:
-        await callback.answer("Неизвестный вариант", show_alert=True)
+        await callback.answer(
+            tr("common.invalid_option", await _state_locale(state)), show_alert=True
+        )
         return
     if callback.data == "ins:no":
         await state.update_data(insulation_material=None, insulation_thickness=0.0)
         await _ask_windows(callback.message, state)
     else:
         await state.set_state(Survey.insulation_material)
+        locale = await _state_locale(state)
         keys = ["mineral_wool", "eps", "xps", "pu_foam"]
-        items = [(MATERIALS[key].name, f"imat:{key}") for key in keys]
-        items.append(("Другой утеплитель — паспортная λ", "imat:custom"))
+        items = [(_material_name(key, locale), f"imat:{key}") for key in keys]
+        items.append((tr("survey.wall.insulation_custom", locale), "imat:custom"))
         await callback.message.answer(
-            "Какой утеплитель?",
-            reply_markup=keyboard(items, 1),
+            tr("survey.wall.insulation", locale),
+            reply_markup=keyboard(items, 1, locale=locale),
         )
     await callback.answer()
 
@@ -787,17 +903,26 @@ async def insulated(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(Survey.insulation_material, F.data.startswith("imat:"))
 async def insulation_material(callback: CallbackQuery, state: FSMContext) -> None:
     key = callback.data.split(":", 1)[1]
+    locale = await _state_locale(state)
     if key == "custom":
         await state.set_state(Survey.insulation_custom_lambda)
-        await callback.message.answer("Паспортная теплопроводность утеплителя λ, Вт/(м·К):")
+        await callback.message.answer(tr("survey.wall.insulation_lambda", locale))
         await callback.answer()
         return
     if key not in {"mineral_wool", "eps", "xps", "pu_foam"}:
-        await callback.answer("Неизвестный утеплитель", show_alert=True)
+        await callback.answer(
+            tr("common.invalid_option", await _state_locale(state)), show_alert=True
+        )
         return
     await state.update_data(insulation_material=key)
     await state.set_state(Survey.insulation_thickness)
-    await callback.message.answer(f"Толщина «{MATERIALS[key].name}» в сантиметрах, например 5:")
+    await callback.message.answer(
+        tr(
+            "survey.wall.insulation_thickness",
+            locale,
+            material=_material_name(key, locale),
+        )
+    )
     await callback.answer()
 
 
@@ -806,14 +931,14 @@ async def insulation_custom_lambda(message: Message, state: FSMContext) -> None:
     try:
         value = _conductivity(message.text)
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
         return
     await state.update_data(
         insulation_material="custom",
         insulation_conductivity=value,
     )
     await state.set_state(Survey.insulation_thickness)
-    await message.answer("Толщина этого утеплителя в сантиметрах:")
+    await message.answer(tr("survey.wall.custom_insulation_thickness", await _state_locale(state)))
 
 
 @router.message(Survey.insulation_thickness)
@@ -821,7 +946,7 @@ async def insulation_thickness(message: Message, state: FSMContext) -> None:
     try:
         value = parse_number(message.text)
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
         return
     await state.update_data(insulation_thickness=value / 100)
     await _ask_windows(message, state)
@@ -832,7 +957,7 @@ async def window_count(message: Message, state: FSMContext) -> None:
     try:
         count = _parse_count(message.text)
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
         return
     await state.update_data(window_count=count)
     if count == 0:
@@ -840,15 +965,18 @@ async def window_count(message: Message, state: FSMContext) -> None:
         await _ask_doors(message, state)
         return
     await state.set_state(Survey.window_method)
+    locale = await _state_locale(state)
     await message.answer(
-        "Как задать окна?",
+        tr("survey.window.method", locale),
         reply_markup=keyboard(
             [
-                ("Суммарной площадью", "window_method:area"),
-                ("Размером одного окна", "window_method:dimensions"),
-                ("Разные группы и U", "window_method:groups"),
+                (tr("survey.opening.area_method", locale), "window_method:area"),
+                (tr("survey.opening.dimensions_method", locale), "window_method:dimensions"),
+                (tr("survey.opening.editor_method", locale), "window_method:editor"),
+                (tr("survey.opening.import_method", locale), "window_method:groups"),
             ],
             1,
+            locale=locale,
         ),
     )
 
@@ -856,17 +984,22 @@ async def window_count(message: Message, state: FSMContext) -> None:
 @router.callback_query(Survey.window_method, F.data.startswith("window_method:"))
 async def window_method(callback: CallbackQuery, state: FSMContext) -> None:
     method = callback.data.split(":", 1)[1]
-    if method not in {"area", "dimensions", "groups"}:
-        await callback.answer("Неизвестный способ ввода окон", show_alert=True)
+    locale = await _state_locale(state)
+    if method not in {"area", "dimensions", "editor", "groups"}:
+        await callback.answer(
+            tr("common.invalid_option", await _state_locale(state)), show_alert=True
+        )
         return
     if method == "area":
         await state.set_state(Survey.window_area)
-        await callback.message.answer("Суммарная площадь всех наружных окон, м²:")
+        await callback.message.answer(tr("survey.window.area", locale))
     elif method == "dimensions":
         await state.set_state(Survey.window_dimensions)
-        await callback.message.answer(
-            "Ширина × высота одного типового окна в метрах, например 1,4x1,5:"
-        )
+        await callback.message.answer(tr("survey.window.dimensions", locale))
+    elif method == "editor":
+        from .opening_editor import start_editor
+
+        await start_editor(callback.message, state, "window")
     else:
         await state.set_state(Survey.window_groups)
         await callback.message.answer(
@@ -890,9 +1023,14 @@ async def _accept_window_area(message: Message, state: FSMContext, area: float) 
         raise ValueError("площадь окон больше площади стен")
     await state.update_data(window_area=area)
     await state.set_state(Survey.window_type)
+    locale = await _state_locale(state)
     await message.answer(
-        "Тип окон:",
-        reply_markup=keyboard([(item.name, f"window:{key}") for key, item in WINDOWS.items()], 1),
+        tr("survey.window.type", locale),
+        reply_markup=keyboard(
+            [(tr(f"window.{key}", locale), f"window:{key}") for key in WINDOWS],
+            1,
+            locale=locale,
+        ),
     )
 
 
@@ -901,7 +1039,7 @@ async def window_area(message: Message, state: FSMContext) -> None:
     try:
         await _accept_window_area(message, state, _nonnegative(message.text))
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
 
 
 @router.message(Survey.window_dimensions)
@@ -914,7 +1052,7 @@ async def window_dimensions(message: Message, state: FSMContext) -> None:
         area = dimensions[0][0] * dimensions[0][1] * data["window_count"]
         await _accept_window_area(message, state, area)
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
 
 
 @router.message(Survey.window_groups)
@@ -946,7 +1084,7 @@ async def window_groups(message: Message, state: FSMContext) -> None:
             if assigned_area > gross_by_wall[wall_name]:
                 raise ValueError(f"окна на стене «{wall_name}» больше площади этой стены")
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
         return
     await state.update_data(window_groups=groups, window_area=area, window_type=None)
     await _ask_doors(message, state)
@@ -956,7 +1094,9 @@ async def window_groups(message: Message, state: FSMContext) -> None:
 async def window_type(callback: CallbackQuery, state: FSMContext) -> None:
     key = callback.data.split(":", 1)[1]
     if key not in WINDOWS:
-        await callback.answer("Неизвестный тип окна", show_alert=True)
+        await callback.answer(
+            tr("common.invalid_option", await _state_locale(state)), show_alert=True
+        )
         return
     await state.update_data(window_type=key)
     await _ask_doors(callback.message, state)
@@ -970,7 +1110,7 @@ async def door_count(message: Message, state: FSMContext) -> None:
         if count > 100:
             raise ValueError("количество дверей должно быть от 0 до 100")
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
         return
     await state.update_data(door_count=count)
     if count == 0:
@@ -978,15 +1118,18 @@ async def door_count(message: Message, state: FSMContext) -> None:
         await _advance_after_openings(message, state)
         return
     await state.set_state(Survey.door_method)
+    locale = await _state_locale(state)
     await message.answer(
-        "Как задать наружные двери?",
+        tr("survey.door.method", locale),
         reply_markup=keyboard(
             [
-                ("Суммарной площадью", "door_method:area"),
-                ("Размером одной двери", "door_method:dimensions"),
-                ("Разные группы и U", "door_method:groups"),
+                (tr("survey.opening.area_method", locale), "door_method:area"),
+                (tr("survey.opening.dimensions_method", locale), "door_method:dimensions"),
+                (tr("survey.opening.editor_method", locale), "door_method:editor"),
+                (tr("survey.opening.import_method", locale), "door_method:groups"),
             ],
             1,
+            locale=locale,
         ),
     )
 
@@ -994,14 +1137,17 @@ async def door_count(message: Message, state: FSMContext) -> None:
 @router.callback_query(Survey.door_method, F.data.startswith("door_method:"))
 async def door_method(callback: CallbackQuery, state: FSMContext) -> None:
     method = callback.data.split(":", 1)[1]
+    locale = await _state_locale(state)
     if method == "area":
         await state.set_state(Survey.door_area)
-        await callback.message.answer("Суммарная площадь наружных дверей, м²:")
+        await callback.message.answer(tr("survey.door.area", locale))
     elif method == "dimensions":
         await state.set_state(Survey.door_dimensions)
-        await callback.message.answer(
-            "Ширина × высота одной типовой двери в метрах, например 0,9x2,1:"
-        )
+        await callback.message.answer(tr("survey.door.dimensions", locale))
+    elif method == "editor":
+        from .opening_editor import start_editor
+
+        await start_editor(callback.message, state, "door")
     elif method == "groups":
         await state.set_state(Survey.door_groups)
         await callback.message.answer(
@@ -1010,17 +1156,20 @@ async def door_method(callback: CallbackQuery, state: FSMContext) -> None:
             "Пример:\nВходная | 1 | 0,9x2,1 | 1,4 | Север"
         )
     else:
-        await callback.answer("Неизвестный способ ввода", show_alert=True)
+        await callback.answer(
+            tr("common.invalid_option", await _state_locale(state)), show_alert=True
+        )
         return
     await callback.answer()
 
 
 async def _ask_door_type(message: Message, state: FSMContext) -> None:
     await state.set_state(Survey.door_type)
-    items = [(item.name, f"door_type:{key}") for key, item in DOORS.items()]
+    locale = await _state_locale(state)
+    items = [(tr(f"door.{key}", locale), f"door_type:{key}") for key in DOORS]
     await message.answer(
-        "Тип двери (справочное U; паспортное значение задаётся через группы):",
-        reply_markup=keyboard(items, 1),
+        tr("survey.door.type", locale),
+        reply_markup=keyboard(items, 1, locale=locale),
     )
 
 
@@ -1034,7 +1183,7 @@ async def door_area(message: Message, state: FSMContext) -> None:
         if area + data["window_area"] > data["wall_gross_area"]:
             raise ValueError("окна и двери больше площади стен")
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
         return
     await state.update_data(door_area=area, door_groups=[])
     await _ask_door_type(message, state)
@@ -1051,7 +1200,7 @@ async def door_dimensions(message: Message, state: FSMContext) -> None:
         if area + data["window_area"] > data["wall_gross_area"]:
             raise ValueError("окна и двери больше площади стен")
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
         return
     await state.update_data(door_area=area, door_groups=[])
     await _ask_door_type(message, state)
@@ -1090,7 +1239,7 @@ async def door_groups(message: Message, state: FSMContext) -> None:
             if door_area_on_wall + window_assigned.get(wall, 0) > gross_by_wall[wall]:
                 raise ValueError(f"окна и двери на стене «{wall}» больше её площади")
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
         return
     await state.update_data(door_groups=groups, door_area=area, door_u_value=None)
     await _advance_after_openings(message, state)
@@ -1100,7 +1249,9 @@ async def door_groups(message: Message, state: FSMContext) -> None:
 async def door_type(callback: CallbackQuery, state: FSMContext) -> None:
     key = callback.data.split(":", 1)[1]
     if key not in DOORS:
-        await callback.answer("Неизвестный тип двери", show_alert=True)
+        await callback.answer(
+            tr("common.invalid_option", await _state_locale(state)), show_alert=True
+        )
         return
     await state.update_data(door_type=key, door_u_value=DOORS[key].u_value)
     await _advance_after_openings(callback.message, state)
@@ -1127,17 +1278,23 @@ async def _advance_after_openings(message: Message, state: FSMContext) -> None:
         return
     if position == "first":
         await state.update_data(ceiling_boundary="heated")
+    await _ask_floor_boundary(message, state)
+
+
+async def _ask_floor_boundary(message: Message, state: FSMContext) -> None:
     await state.set_state(Survey.floor_boundary)
+    locale = await _state_locale(state)
     await message.answer(
-        "Шаг 6/9 — пол и потолок. Что находится под полом?",
+        tr("survey.boundary.floor", locale),
         reply_markup=keyboard(
             [
-                ("Отапливаемый сосед", "floor:heated"),
-                ("Холодный подвал", "floor:unheated"),
-                ("Грунт", "floor:ground"),
-                ("Наружный воздух", "floor:outdoor"),
+                (tr("survey.boundary.heated_neighbor", locale), "floor:heated"),
+                (tr("survey.boundary.unheated_basement", locale), "floor:unheated"),
+                (tr("survey.boundary.ground", locale), "floor:ground"),
+                (tr("survey.boundary.outdoor", locale), "floor:outdoor"),
             ],
             1,
+            locale=locale,
         ),
     )
 
@@ -1146,7 +1303,9 @@ async def _advance_after_openings(message: Message, state: FSMContext) -> None:
 async def floor_boundary(callback: CallbackQuery, state: FSMContext) -> None:
     value = callback.data.split(":", 1)[1]
     if value not in {item.value for item in Boundary}:
-        await callback.answer("Неизвестное условие под полом", show_alert=True)
+        await callback.answer(
+            tr("common.invalid_option", await _state_locale(state)), show_alert=True
+        )
         return
     await state.update_data(floor_boundary=value)
     if value == "heated":
@@ -1167,15 +1326,17 @@ async def _ask_ceiling(message: Message, state: FSMContext) -> None:
         await _ask_air_changes(message, state)
         return
     await state.set_state(Survey.ceiling_boundary)
+    locale = await _state_locale(state)
     await message.answer(
-        "Шаг 6/9 — пол и потолок. Что находится над потолком?",
+        tr("survey.boundary.ceiling", locale),
         reply_markup=keyboard(
             [
-                ("Отапливаемый сосед", "ceiling:heated"),
-                ("Холодный чердак", "ceiling:unheated"),
-                ("Наружный воздух / кровля", "ceiling:outdoor"),
+                (tr("survey.boundary.heated_neighbor", locale), "ceiling:heated"),
+                (tr("survey.boundary.unheated_attic", locale), "ceiling:unheated"),
+                (tr("survey.boundary.roof", locale), "ceiling:outdoor"),
             ],
             1,
+            locale=locale,
         ),
     )
 
@@ -1184,7 +1345,9 @@ async def _ask_ceiling(message: Message, state: FSMContext) -> None:
 async def ceiling_boundary(callback: CallbackQuery, state: FSMContext) -> None:
     value = callback.data.split(":", 1)[1]
     if value not in {"heated", "unheated", "outdoor"}:
-        await callback.answer("Неизвестное условие над потолком", show_alert=True)
+        await callback.answer(
+            tr("common.invalid_option", await _state_locale(state)), show_alert=True
+        )
         return
     await state.update_data(ceiling_boundary=value)
     if value == "heated":
@@ -1204,32 +1367,46 @@ async def _ask_adjacent_mode(
 ) -> None:
     await state.update_data(active_surface=surface, active_boundary=boundary)
     await state.set_state(Survey.surface_adjacent_mode)
-    zone = "подвала/грунта под полом" if surface == "floor" else "холодного чердака"
-    estimate = "50% наружной ΔT" if boundary == "ground" else "70% наружной ΔT"
+    locale = await _state_locale(state)
+    zone = tr(
+        "survey.adjacent.basement" if surface == "floor" else "survey.adjacent.attic",
+        locale,
+    )
+    estimate = tr(
+        "survey.adjacent.ground_estimate"
+        if boundary == "ground"
+        else "survey.adjacent.unheated_estimate",
+        locale,
+    )
     choices = [
-        ("Ввести температуру", f"adjacent:{surface}:manual"),
-        (f"Оставить оценку {estimate}", f"adjacent:{surface}:estimate"),
+        (tr("survey.adjacent.manual", locale), f"adjacent:{surface}:manual"),
+        (
+            tr("survey.adjacent.estimate", locale, estimate=estimate),
+            f"adjacent:{surface}:estimate",
+        ),
     ]
     if surface == "floor" and boundary == "ground":
-        choices.insert(0, ("Нормативные зоны ШНҚ", "adjacent:floor:zonal"))
+        choices.insert(0, (tr("survey.adjacent.zonal", locale), "adjacent:floor:zonal"))
     await message.answer(
-        f"Температура {zone} известна? Точное значение лучше фиксированного коэффициента.",
-        reply_markup=keyboard(choices, 1),
+        tr("survey.adjacent.question", locale, zone=zone),
+        reply_markup=keyboard(choices, 1, locale=locale),
     )
 
 
 async def _ask_heated_neighbor_mode(message: Message, state: FSMContext, surface: str) -> None:
     await state.update_data(active_surface=surface, active_boundary="heated")
     await state.set_state(Survey.surface_adjacent_mode)
-    zone = "соседа снизу" if surface == "floor" else "соседа сверху"
+    locale = await _state_locale(state)
+    zone = tr("survey.neighbor.below" if surface == "floor" else "survey.neighbor.above", locale)
     await message.answer(
-        f"Температура {zone} такая же, как внутри объекта?",
+        tr("survey.neighbor.question", locale, zone=zone),
         reply_markup=keyboard(
             [
-                ("Такая же — потерь нет", f"adjacent:{surface}:same"),
-                ("Ввести температуру соседа", f"adjacent:{surface}:manual"),
+                (tr("survey.neighbor.same", locale), f"adjacent:{surface}:same"),
+                (tr("survey.neighbor.manual", locale), f"adjacent:{surface}:manual"),
             ],
             1,
+            locale=locale,
         ),
     )
 
@@ -1237,38 +1414,42 @@ async def _ask_heated_neighbor_mode(message: Message, state: FSMContext, surface
 async def _ask_ground_insulation(message: Message, state: FSMContext) -> None:
     await state.update_data(active_surface="floor")
     await state.set_state(Survey.surface_insulated)
+    locale = await _state_locale(state)
     await message.answer(
-        "Есть утепляющий слой пола с λ < 1,2 Вт/(м·К)? "
-        "Основная бетонная плита в нормативный R зоны отдельно не добавляется.",
-        reply_markup=keyboard([("Да", "sins:yes"), ("Нет", "sins:no")]),
+        tr("survey.ground.insulation", locale),
+        reply_markup=keyboard(
+            [(tr("common.yes", locale), "sins:yes"), (tr("common.no", locale), "sins:no")],
+            locale=locale,
+        ),
     )
 
 
 async def _ask_ground_exterior_sides(message: Message, state: FSMContext) -> None:
     await state.set_state(Survey.ground_exterior_sides)
+    locale = await _state_locale(state)
     await message.answer(
-        "Какие стороны прямоугольного пола граничат с наружными стенами? "
-        "Север/юг — стороны длиной L, восток/запад — стороны шириной W.",
+        tr("survey.ground.sides", locale),
         reply_markup=keyboard(
             [
-                ("Все 4 стороны", "gsides:n,e,s,w"),
-                ("Север (L)", "gsides:n"),
-                ("Восток (W)", "gsides:e"),
-                ("Юг (L)", "gsides:s"),
-                ("Запад (W)", "gsides:w"),
-                ("Север + юг", "gsides:n,s"),
-                ("Восток + запад", "gsides:e,w"),
-                ("Север + восток", "gsides:n,e"),
-                ("Восток + юг", "gsides:e,s"),
-                ("Юг + запад", "gsides:s,w"),
-                ("Запад + север", "gsides:w,n"),
-                ("Без севера", "gsides:e,s,w"),
-                ("Без востока", "gsides:n,s,w"),
-                ("Без юга", "gsides:n,e,w"),
-                ("Без запада", "gsides:n,e,s"),
-                ("Сложный план", "gsides:complex"),
+                (tr("survey.ground.sides.all", locale), "gsides:n,e,s,w"),
+                (tr("survey.ground.sides.n", locale), "gsides:n"),
+                (tr("survey.ground.sides.e", locale), "gsides:e"),
+                (tr("survey.ground.sides.s", locale), "gsides:s"),
+                (tr("survey.ground.sides.w", locale), "gsides:w"),
+                (tr("survey.ground.sides.ns", locale), "gsides:n,s"),
+                (tr("survey.ground.sides.ew", locale), "gsides:e,w"),
+                (tr("survey.ground.sides.ne", locale), "gsides:n,e"),
+                (tr("survey.ground.sides.es", locale), "gsides:e,s"),
+                (tr("survey.ground.sides.sw", locale), "gsides:s,w"),
+                (tr("survey.ground.sides.wn", locale), "gsides:w,n"),
+                (tr("survey.ground.sides.no_n", locale), "gsides:e,s,w"),
+                (tr("survey.ground.sides.no_e", locale), "gsides:n,s,w"),
+                (tr("survey.ground.sides.no_s", locale), "gsides:n,e,w"),
+                (tr("survey.ground.sides.no_w", locale), "gsides:n,e,s"),
+                (tr("survey.ground.sides.complex", locale), "gsides:complex"),
             ],
             2,
+            locale=locale,
         ),
     )
 
@@ -1277,31 +1458,38 @@ async def _ask_ground_exterior_sides(message: Message, state: FSMContext) -> Non
 async def ground_exterior_sides(callback: CallbackQuery, state: FSMContext) -> None:
     code = callback.data.split(":", 1)[1]
     if code == "complex":
-        await callback.answer("Сложный план нельзя считать как один прямоугольник", show_alert=True)
+        await callback.answer(
+            tr("common.invalid_option", await _state_locale(state)), show_alert=True
+        )
         await callback.message.answer(
-            "Этот метод пока не аппроксимирует сложный контур: результат был бы ненадёжным. "
-            "Разбейте план на прямоугольники и выполните отдельные расчёты."
+            tr("survey.ground.complex_help", await _state_locale(state))
         )
         return
     mapping = {"n": "north", "e": "east", "s": "south", "w": "west"}
     try:
         sides = [mapping[item] for item in code.split(",")]
     except KeyError:
-        await callback.answer("Неизвестный набор сторон", show_alert=True)
+        await callback.answer(
+            tr("common.invalid_option", await _state_locale(state)), show_alert=True
+        )
         return
     if len(sides) != len(set(sides)):
-        await callback.answer("Стороны не должны повторяться", show_alert=True)
+        await callback.answer(
+            tr("common.invalid_option", await _state_locale(state)), show_alert=True
+        )
         return
     await state.update_data(ground_exterior_sides=sides, ground_plan_shape="rectangle")
     await state.set_state(Survey.ground_floor_construction)
+    locale = await _state_locale(state)
     await callback.message.answer(
-        "Конструкция пола по грунту:",
+        tr("survey.ground.construction", locale),
         reply_markup=keyboard(
             [
-                ("Сплошной пол", "ground_floor:solid"),
-                ("Пол на лагах", "ground_floor:joists"),
+                (tr("survey.ground.solid", locale), "ground_floor:solid"),
+                (tr("survey.ground.joists", locale), "ground_floor:joists"),
             ],
             1,
+            locale=locale,
         ),
     )
     await callback.answer()
@@ -1311,7 +1499,9 @@ async def ground_exterior_sides(callback: CallbackQuery, state: FSMContext) -> N
 async def ground_floor_construction(callback: CallbackQuery, state: FSMContext) -> None:
     value = callback.data.split(":", 1)[1]
     if value not in {"solid", "joists"}:
-        await callback.answer("Неизвестная конструкция пола", show_alert=True)
+        await callback.answer(
+            tr("common.invalid_option", await _state_locale(state)), show_alert=True
+        )
         return
     await state.update_data(floor_on_joists=value == "joists")
     await _ask_ground_insulation(callback.message, state)
@@ -1323,11 +1513,15 @@ async def surface_adjacent_mode(callback: CallbackQuery, state: FSMContext) -> N
     try:
         _, surface, mode = callback.data.split(":", 2)
     except ValueError:
-        await callback.answer("Некорректная кнопка", show_alert=True)
+        await callback.answer(
+            tr("common.invalid_option", await _state_locale(state)), show_alert=True
+        )
         return
     data = await state.get_data()
     if surface != data.get("active_surface"):
-        await callback.answer("Устаревшая кнопка", show_alert=True)
+        await callback.answer(
+            tr("common.invalid_option", await _state_locale(state)), show_alert=True
+        )
         return
     allowed_modes = {"manual", "estimate"}
     if data.get("active_boundary") == "ground":
@@ -1335,7 +1529,9 @@ async def surface_adjacent_mode(callback: CallbackQuery, state: FSMContext) -> N
     if data.get("active_boundary") == "heated":
         allowed_modes.add("same")
     if mode not in allowed_modes:
-        await callback.answer("Неизвестный режим смежной зоны", show_alert=True)
+        await callback.answer(
+            tr("common.invalid_option", await _state_locale(state)), show_alert=True
+        )
         return
     if mode == "same" and data.get("active_boundary") == "heated":
         await state.update_data(
@@ -1349,9 +1545,7 @@ async def surface_adjacent_mode(callback: CallbackQuery, state: FSMContext) -> N
         if surface == "floor":
             await state.update_data(floor_ground_method="temperature")
         await state.set_state(Survey.surface_adjacent_temperature)
-        await callback.message.answer(
-            "Расчётная температура смежной зоны, °C. Например, для подвала +5:"
-        )
+        await callback.message.answer(tr("survey.adjacent.temperature", await _state_locale(state)))
     else:
         if surface == "floor":
             method = "zonal" if mode == "zonal" else "factor"
@@ -1372,7 +1566,7 @@ async def surface_adjacent_temperature(message: Message, state: FSMContext) -> N
         if value >= data["indoor"]:
             raise ValueError("температура смежной зоны должна быть ниже температуры внутри")
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
         return
     surface = data["active_surface"]
     await state.update_data(
@@ -1387,13 +1581,14 @@ async def surface_adjacent_temperature(message: Message, state: FSMContext) -> N
 async def _ask_surface_material(message: Message, state: FSMContext, surface: str) -> None:
     await state.update_data(active_surface=surface)
     await state.set_state(Survey.surface_material)
-    title = "пола" if surface == "floor" else "перекрытия/крыши"
+    locale = await _state_locale(state)
+    title = tr("survey.surface.floor" if surface == "floor" else "survey.surface.ceiling", locale)
     keys = ["concrete", "brick_solid", "aerated_d500", "wood"]
-    items = [(MATERIALS[key].name, f"smat:{key}") for key in keys]
-    items.append(("Другой материал — паспортная λ", "smat:custom"))
+    items = [(_material_name(key, locale), f"smat:{key}") for key in keys]
+    items.append((tr("survey.wall.material_custom", locale), "smat:custom"))
     await message.answer(
-        f"Основной материал {title}:",
-        reply_markup=keyboard(items, 1),
+        tr("survey.surface.material", locale, surface=title),
+        reply_markup=keyboard(items, 1, locale=locale),
     )
 
 
@@ -1402,17 +1597,22 @@ async def surface_material(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     surface = data["active_surface"]
     key = callback.data.split(":", 1)[1]
+    locale = await _state_locale(state)
     if key == "custom":
         await state.set_state(Survey.surface_custom_lambda)
-        await callback.message.answer("Паспортная теплопроводность материала λ, Вт/(м·К):")
+        await callback.message.answer(tr("survey.wall.custom_lambda", locale))
         await callback.answer()
         return
     if key not in MATERIALS:
-        await callback.answer("Неизвестный материал", show_alert=True)
+        await callback.answer(
+            tr("common.invalid_option", await _state_locale(state)), show_alert=True
+        )
         return
     await state.update_data(**{f"{surface}_material": key})
     await state.set_state(Survey.surface_thickness)
-    await callback.message.answer(f"Толщина слоя «{MATERIALS[key].name}» в сантиметрах:")
+    await callback.message.answer(
+        tr("survey.wall.thickness", locale, material=_material_name(key, locale))
+    )
     await callback.answer()
 
 
@@ -1421,13 +1621,13 @@ async def surface_custom_lambda(message: Message, state: FSMContext) -> None:
     try:
         value = _conductivity(message.text)
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
         return
     data = await state.get_data()
     surface = data["active_surface"]
     await state.update_data(**{f"{surface}_material": "custom", f"{surface}_conductivity": value})
     await state.set_state(Survey.surface_thickness)
-    await message.answer("Толщина этого материала в сантиметрах:")
+    await message.answer(tr("survey.wall.custom_thickness", await _state_locale(state)))
 
 
 @router.message(Survey.surface_thickness)
@@ -1435,22 +1635,28 @@ async def surface_thickness(message: Message, state: FSMContext) -> None:
     try:
         value = parse_number(message.text)
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
         return
     data = await state.get_data()
     surface = data["active_surface"]
     await state.update_data(**{f"{surface}_thickness": value / 100})
     await state.set_state(Survey.surface_insulated)
+    locale = await _state_locale(state)
     await message.answer(
-        "Есть утепление?",
-        reply_markup=keyboard([("Да", "sins:yes"), ("Нет", "sins:no")]),
+        tr("survey.surface.insulated", locale),
+        reply_markup=keyboard(
+            [(tr("common.yes", locale), "sins:yes"), (tr("common.no", locale), "sins:no")],
+            locale=locale,
+        ),
     )
 
 
 @router.callback_query(Survey.surface_insulated, F.data.startswith("sins:"))
 async def surface_insulated(callback: CallbackQuery, state: FSMContext) -> None:
     if callback.data not in {"sins:yes", "sins:no"}:
-        await callback.answer("Неизвестный вариант", show_alert=True)
+        await callback.answer(
+            tr("common.invalid_option", await _state_locale(state)), show_alert=True
+        )
         return
     data = await state.get_data()
     surface = data["active_surface"]
@@ -1461,12 +1667,13 @@ async def surface_insulated(callback: CallbackQuery, state: FSMContext) -> None:
         await _finish_surface(callback.message, state, surface)
     else:
         await state.set_state(Survey.surface_insulation_material)
+        locale = await _state_locale(state)
         keys = ["mineral_wool", "eps", "xps", "pu_foam"]
-        items = [(MATERIALS[key].name, f"simat:{key}") for key in keys]
-        items.append(("Другой утеплитель — паспортная λ", "simat:custom"))
+        items = [(_material_name(key, locale), f"simat:{key}") for key in keys]
+        items.append((tr("survey.wall.insulation_custom", locale), "simat:custom"))
         await callback.message.answer(
-            "Материал утепления:",
-            reply_markup=keyboard(items, 1),
+            tr("survey.surface.insulation", locale),
+            reply_markup=keyboard(items, 1, locale=locale),
         )
     await callback.answer()
 
@@ -1476,17 +1683,22 @@ async def surface_insulation_material(callback: CallbackQuery, state: FSMContext
     data = await state.get_data()
     surface = data["active_surface"]
     key = callback.data.split(":", 1)[1]
+    locale = await _state_locale(state)
     if key == "custom":
         await state.set_state(Survey.surface_insulation_custom_lambda)
-        await callback.message.answer("Паспортная теплопроводность утеплителя λ, Вт/(м·К):")
+        await callback.message.answer(tr("survey.wall.insulation_lambda", locale))
         await callback.answer()
         return
     if key not in {"mineral_wool", "eps", "xps", "pu_foam"}:
-        await callback.answer("Неизвестный утеплитель", show_alert=True)
+        await callback.answer(
+            tr("common.invalid_option", await _state_locale(state)), show_alert=True
+        )
         return
     await state.update_data(**{f"{surface}_insulation_material": key})
     await state.set_state(Survey.surface_insulation_thickness)
-    await callback.message.answer(f"Толщина «{MATERIALS[key].name}» в сантиметрах:")
+    await callback.message.answer(
+        tr("survey.wall.insulation_thickness", locale, material=_material_name(key, locale))
+    )
     await callback.answer()
 
 
@@ -1495,7 +1707,7 @@ async def surface_insulation_custom_lambda(message: Message, state: FSMContext) 
     try:
         value = _conductivity(message.text)
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
         return
     data = await state.get_data()
     surface = data["active_surface"]
@@ -1506,7 +1718,7 @@ async def surface_insulation_custom_lambda(message: Message, state: FSMContext) 
         }
     )
     await state.set_state(Survey.surface_insulation_thickness)
-    await message.answer("Толщина этого утеплителя в сантиметрах:")
+    await message.answer(tr("survey.wall.custom_insulation_thickness", await _state_locale(state)))
 
 
 @router.message(Survey.surface_insulation_thickness)
@@ -1514,7 +1726,7 @@ async def surface_insulation_thickness(message: Message, state: FSMContext) -> N
     try:
         value = parse_number(message.text)
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
         return
     data = await state.get_data()
     surface = data["active_surface"]
@@ -1532,26 +1744,36 @@ async def _finish_surface(message: Message, state: FSMContext, surface: str) -> 
 async def _ask_air_changes(message: Message, state: FSMContext) -> None:
     await state.set_state(Survey.air_changes)
     data = await state.get_data()
+    locale = str(data.get("locale") or "ru")
     if data.get("calculation_mode") == "advanced":
         await message.answer(
-            "Шаг 7/9 — вентиляция. Как вводить отдельные расчётные потоки?",
+            tr("survey.air.advanced", locale),
             reply_markup=keyboard(
                 [
-                    ("Расходы, м³/ч", "airflow_unit:m3h"),
-                    ("Кратности, 1/ч", "airflow_unit:ach"),
+                    (tr("survey.air.unit.m3h", locale), "airflow_unit:m3h"),
+                    (tr("survey.air.unit.ach", locale), "airflow_unit:ach"),
                 ],
                 1,
+                locale=locale,
             ),
         )
         return
+    options = [("0,3", "ach:0.3"), ("0,5", "ach:0.5"), ("0,8", "ach:0.8"), ("1,0", "ach:1.0")]
+    try:
+        profile_ach = float(data.get("profile_defaults", {}).get("air_changes"))
+    except (TypeError, ValueError):
+        profile_ach = math.nan
+    if profile_ach in {0.3, 0.5, 0.8, 1.0}:
+        options = [
+            (
+                tr("survey.air.from_profile", locale, value=f"{profile_ach:g}"),
+                f"ach:{profile_ach:g}",
+            ),
+            *[item for item in options if item[1] != f"ach:{profile_ach:g}"],
+        ]
     await message.answer(
-        "Шаг 7/9 — вентиляция. Оцените воздухообмен: герметичное здание — 0,3; "
-        "обычное — 0,5; "
-        "старое/продуваемое — 0,8–1,0. В быстром режиме это единый "
-        "невосстанавливаемый поток; рекуперация из него не вычитается.",
-        reply_markup=keyboard(
-            [("0,3", "ach:0.3"), ("0,5", "ach:0.5"), ("0,8", "ach:0.8"), ("1,0", "ach:1.0")]
-        ),
+        tr("survey.air.quick", locale),
+        reply_markup=keyboard(options, locale=locale),
     )
 
 
@@ -1560,14 +1782,21 @@ async def air_changes(callback: CallbackQuery, state: FSMContext) -> None:
     try:
         ach = float(callback.data.split(":", 1)[1])
     except (IndexError, ValueError):
-        await callback.answer("Некорректный воздухообмен", show_alert=True)
+        await callback.answer(
+            tr("survey.air.error.invalid", await _state_locale(state)), show_alert=True
+        )
         return
     if ach not in {0.3, 0.5, 0.8, 1.0}:
-        await callback.answer("Неизвестный вариант воздухообмена", show_alert=True)
+        await callback.answer(
+            tr("survey.air.error.option", await _state_locale(state)), show_alert=True
+        )
         return
     data = await state.get_data()
     if data.get("calculation_mode") == "advanced":
-        await callback.answer("Выберите единицы раздельных потоков", show_alert=True)
+        await callback.answer(
+            tr("survey.air.error.units_required", await _state_locale(state)),
+            show_alert=True,
+        )
         return
     combined_flow = ach * data["volume"]
     await state.update_data(
@@ -1578,10 +1807,17 @@ async def air_changes(callback: CallbackQuery, state: FSMContext) -> None:
         airflow_input_basis="quick_estimate",
     )
     await state.set_state(Survey.heat_recovery)
+    locale = await _state_locale(state)
     await callback.message.answer(
-        "Есть рекуператор? В быстром режиме он фиксируется справочно, но не уменьшает "
-        "общую оценку: для этого нужны раздельные потоки расширенного режима.",
-        reply_markup=keyboard([("Нет", "recovery:no"), ("Да", "recovery:yes")], 2),
+        tr("survey.recovery.quick", locale),
+        reply_markup=keyboard(
+            [
+                (tr("common.no", locale), "recovery:no"),
+                (tr("common.yes", locale), "recovery:yes"),
+            ],
+            2,
+            locale=locale,
+        ),
     )
     await callback.answer()
 
@@ -1590,17 +1826,23 @@ async def air_changes(callback: CallbackQuery, state: FSMContext) -> None:
 async def airflow_unit(callback: CallbackQuery, state: FSMContext) -> None:
     unit = callback.data.split(":", 1)[1]
     if unit not in {"m3h", "ach"}:
-        await callback.answer("Неизвестные единицы расхода", show_alert=True)
+        await callback.answer(
+            tr("survey.air.error.units", await _state_locale(state)), show_alert=True
+        )
         return
     data = await state.get_data()
     if data.get("calculation_mode") != "advanced":
-        await callback.answer("Раздельный ввод доступен в расширенном режиме", show_alert=True)
+        await callback.answer(
+            tr("survey.air.error.advanced_only", await _state_locale(state)),
+            show_alert=True,
+        )
         return
     await state.update_data(airflow_input_basis=f"components_{unit}")
     await state.set_state(Survey.mechanical_ventilation)
-    suffix = "м³/ч" if unit == "m3h" else "1/ч"
+    locale = await _state_locale(state)
+    suffix = tr(f"survey.air.units.{unit}", locale)
     await callback.message.answer(
-        f"Расход организованной механической вентиляции, {suffix}. Если её нет — 0:"
+        tr("survey.air.mechanical", locale, unit=suffix)
     )
     await callback.answer()
 
@@ -1624,7 +1866,7 @@ async def _parse_airflow_component(
             label="Расход воздуха",
         )
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
         return None
     return _airflow_value_to_m3_h(value, data), data
 
@@ -1637,8 +1879,11 @@ async def mechanical_ventilation(message: Message, state: FSMContext) -> None:
     value, data = parsed
     await state.update_data(mechanical_ventilation_m3_h=value)
     await state.set_state(Survey.natural_ventilation)
-    suffix = "м³/ч" if data["airflow_input_basis"] == "components_m3h" else "1/ч"
-    await message.answer(f"Расход естественной организованной вентиляции, {suffix}. Нет — 0:")
+    unit = "m3h" if data["airflow_input_basis"] == "components_m3h" else "ach"
+    suffix = tr(f"survey.air.units.{unit}", await _state_locale(state))
+    await message.answer(
+        tr("survey.air.natural", await _state_locale(state), unit=suffix)
+    )
 
 
 @router.message(Survey.natural_ventilation)
@@ -1649,8 +1894,11 @@ async def natural_ventilation(message: Message, state: FSMContext) -> None:
     value, data = parsed
     await state.update_data(natural_ventilation_m3_h=value)
     await state.set_state(Survey.infiltration)
-    suffix = "м³/ч" if data["airflow_input_basis"] == "components_m3h" else "1/ч"
-    await message.answer(f"Расчётная инфильтрация через неплотности, {suffix}. Нет — 0:")
+    unit = "m3h" if data["airflow_input_basis"] == "components_m3h" else "ach"
+    suffix = tr(f"survey.air.units.{unit}", await _state_locale(state))
+    await message.answer(
+        tr("survey.air.infiltration", await _state_locale(state), unit=suffix)
+    )
 
 
 @router.message(Survey.infiltration)
@@ -1663,9 +1911,17 @@ async def infiltration(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     if data["mechanical_ventilation_m3_h"] > 0:
         await state.set_state(Survey.heat_recovery)
+        locale = await _state_locale(state)
         await message.answer(
-            "Есть рекуперация механической вентиляции?",
-            reply_markup=keyboard([("Нет", "recovery:no"), ("Да", "recovery:yes")], 2),
+            tr("survey.air.recovery", locale),
+            reply_markup=keyboard(
+                [
+                    (tr("common.no", locale), "recovery:no"),
+                    (tr("common.yes", locale), "recovery:yes"),
+                ],
+                2,
+                locale=locale,
+            ),
         )
     else:
         await state.update_data(heat_recovery_efficiency=0.0)
@@ -1680,11 +1936,13 @@ async def heat_recovery(callback: CallbackQuery, state: FSMContext) -> None:
         await state.update_data(heat_recovery_efficiency=0.0)
         if value == "yes":
             await callback.message.answer(
-                "Рекуператор не вычтен из общей оценки. Повторите расчёт в расширенном "
-                "режиме, чтобы задать механическую вентиляцию отдельно."
+                tr("survey.recovery.quick_note", await _state_locale(state))
             )
         elif value != "no":
-            await callback.answer("Неизвестный вариант", show_alert=True)
+            await callback.answer(
+                tr("survey.air.error.recovery", await _state_locale(state)),
+                show_alert=True,
+            )
             return
         await _ask_thermal_bridges(callback.message, state)
         await callback.answer()
@@ -1694,9 +1952,13 @@ async def heat_recovery(callback: CallbackQuery, state: FSMContext) -> None:
         await _ask_thermal_bridges(callback.message, state)
     elif value == "yes":
         await state.set_state(Survey.heat_recovery_efficiency)
-        await callback.message.answer("Паспортный КПД рекуператора, %. Например 70:")
+        await callback.message.answer(
+            tr("survey.air.recovery_efficiency", await _state_locale(state))
+        )
     else:
-        await callback.answer("Неизвестный вариант", show_alert=True)
+        await callback.answer(
+            tr("survey.air.error.recovery", await _state_locale(state)), show_alert=True
+        )
         return
     await callback.answer()
 
@@ -1714,7 +1976,7 @@ async def heat_recovery_efficiency(message: Message, state: FSMContext) -> None:
             / 100
         )
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
         return
     await state.update_data(heat_recovery_efficiency=efficiency)
     await _ask_thermal_bridges(message, state)
@@ -1722,17 +1984,20 @@ async def heat_recovery_efficiency(message: Message, state: FSMContext) -> None:
 
 async def _ask_thermal_bridges(message: Message, state: FSMContext) -> None:
     await state.set_state(Survey.thermal_bridges)
+    locale = await _state_locale(state)
     await message.answer(
-        "Шаг 8/9 — мостики холода (стыки, углы, перемычки, балконы):",
+        tr("survey.bridges.question", locale),
         reply_markup=keyboard(
             [
-                ("0% — рассчитаны отдельно", "bridges:0"),
-                ("5% — хорошее исполнение", "bridges:0.05"),
-                ("10% — обычное", "bridges:0.10"),
-                ("15% — много слабых узлов", "bridges:0.15"),
-                ("Точно: ψ × длина", "bridges:exact"),
+                (tr("survey.bridges.zero", locale), "bridges:0"),
+                (tr("survey.bridges.good", locale), "bridges:0.05"),
+                (tr("survey.bridges.normal", locale), "bridges:0.10"),
+                (tr("survey.bridges.weak", locale), "bridges:0.15"),
+                (tr("survey.bridges.exact", locale), "bridges:exact"),
+                (tr("survey.bridges.import", locale), "bridges:import"),
             ],
             1,
+            locale=locale,
         ),
     )
 
@@ -1744,6 +2009,12 @@ async def thermal_bridges(
 ) -> None:
     value = callback.data.split(":", 1)[1]
     if value == "exact":
+        from .bridge_editor import start_editor
+
+        await start_editor(callback.message, state)
+        await callback.answer()
+        return
+    if value == "import":
         await state.set_state(Survey.thermal_bridge_details)
         await callback.message.answer(
             "Каждый мостик — с новой строки:\n"
@@ -1753,7 +2024,9 @@ async def thermal_bridges(
         await callback.answer()
         return
     if value not in {"0", "0.05", "0.10", "0.15"}:
-        await callback.answer("Неизвестная поправка", show_alert=True)
+        await callback.answer(
+            tr("common.invalid_option", await _state_locale(state)), show_alert=True
+        )
         return
     await state.update_data(
         thermal_bridge_factor=float(value),
@@ -1768,7 +2041,7 @@ async def thermal_bridge_details(message: Message, state: FSMContext) -> None:
     try:
         bridges = parse_linear_thermal_bridges(message.text)
     except ValueError as exc:
-        await _error(message, exc)
+        await _error(message, exc, state)
         return
     await state.update_data(
         thermal_bridge_factor=0.0,
@@ -1779,24 +2052,47 @@ async def thermal_bridge_details(message: Message, state: FSMContext) -> None:
 
 async def _ask_safety_factor(message: Message, state: FSMContext) -> None:
     await state.set_state(Survey.safety_factor)
+    locale = await _state_locale(state)
+    options = [
+        ("0%", "safety:1.0"),
+        (tr("survey.safety.normal", locale), "safety:1.10"),
+        ("15%", "safety:1.15"),
+        ("20%", "safety:1.20"),
+    ]
+    data = await state.get_data()
+    try:
+        profile_factor = float(data.get("profile_defaults", {}).get("safety_factor"))
+    except (TypeError, ValueError):
+        profile_factor = math.nan
+    if profile_factor in {1.0, 1.10, 1.15, 1.20}:
+        callback_data = f"safety:{profile_factor}"
+        options = [
+            (
+                tr(
+                    "survey.safety.from_profile",
+                    locale,
+                    value=f"{(profile_factor - 1) * 100:.0f}",
+                ),
+                callback_data,
+            ),
+            *[item for item in options if float(item[1].split(":", 1)[1]) != profile_factor],
+        ]
     await message.answer(
-        "Шаг 9/9 — эксплуатационный запас после всех рассчитанных потерь:",
-        reply_markup=keyboard(
-            [
-                ("0%", "safety:1.0"),
-                ("10% — обычно", "safety:1.10"),
-                ("15%", "safety:1.15"),
-                ("20%", "safety:1.20"),
-            ],
-            2,
-        ),
+        tr("survey.safety.question", locale),
+        reply_markup=keyboard(options, 2, locale=locale),
     )
 
 
 def _confirmation_text(data: dict) -> str:
-    building = "Квартира" if data.get("building_type") == "apartment" else "Частный дом"
+    locale = str(data.get("locale") or "ru")
+    building = tr(f"survey.object.{data.get('building_type', 'house')}", locale)
     climate_key = str(data.get("climate_key", "manual"))
-    climate_name = CLIMATES[climate_key].name if climate_key in CLIMATES else climate_key
+    if climate_key in CLIMATES:
+        climate_name = tr(f"climate.{climate_key}", locale)
+    elif climate_key == "custom" and data.get("custom_city_name"):
+        climate_name = str(data["custom_city_name"])
+    else:
+        climate_name = tr("survey.climate.manual_name", locale)
     wall_area = float(data.get("wall_gross_area", 0))
     openings_area = float(data.get("window_area", 0)) + float(data.get("door_area", 0))
     airflow = (
@@ -1805,20 +2101,28 @@ def _confirmation_text(data: dict) -> str:
         + float(data.get("infiltration_m3_h", 0))
     )
     if not airflow:
-        airflow_text = f"{float(data.get('air_changes', 0)):g} 1/ч (упрощённо)"
+        airflow_text = tr(
+            "survey.confirm.airflow_simple",
+            locale,
+            value=f"{float(data.get('air_changes', 0)):g}",
+        )
     else:
-        airflow_text = f"{airflow:g} м³/ч суммарно"
-    return (
-        "✅ Проверьте исходные данные перед расчётом\n\n"
-        f"Объект: {building}\n"
-        f"Климат: {climate_name}, наружная {float(data.get('outdoor', 0)):g} °C\n"
-        f"Внутри: {float(data.get('indoor', 0)):g} °C\n"
-        f"Габариты: {float(data.get('length', 0)):g} × "
-        f"{float(data.get('width', 0)):g} × {float(data.get('height', 0)):g} м\n"
-        f"Стены брутто: {wall_area:g} м²; проёмы: {openings_area:g} м²\n"
-        f"Воздухообмен: {airflow_text}\n"
-        f"Запас: {(float(data.get('safety_factor', 1)) - 1) * 100:.0f}%\n\n"
-        "Если всё верно, нажмите «Рассчитать»."
+        airflow_text = tr("survey.confirm.airflow_total", locale, value=f"{airflow:g}")
+    return tr(
+        "survey.confirm.body",
+        locale,
+        title=tr("survey.confirm.title", locale),
+        building=building,
+        climate=climate_name,
+        outdoor=f"{float(data.get('outdoor', 0)):g}",
+        indoor=f"{float(data.get('indoor', 0)):g}",
+        length=f"{float(data.get('length', 0)):g}",
+        width=f"{float(data.get('width', 0)):g}",
+        height=f"{float(data.get('height', 0)):g}",
+        walls=f"{wall_area:g}",
+        openings=f"{openings_area:g}",
+        airflow=airflow_text,
+        safety=f"{(float(data.get('safety_factor', 1)) - 1) * 100:.0f}",
     )
 
 
@@ -1828,30 +2132,22 @@ async def _ask_confirmation(message: Message, state: FSMContext) -> None:
         await state.update_data(calculation_request_id=secrets.token_urlsafe(18))
         data = await state.get_data()
     await state.set_state(Survey.confirmation)
-    visible_inputs = {
-        key: value
-        for key, value in data.items()
-        if not key.startswith("_") and key != "calculation_request_id"
-    }
-    await _send_long_message(
-        message,
-        "Полный снимок исходных данных (значения хранятся в единицах СИ):\n"
-        + json.dumps(visible_inputs, ensure_ascii=False, indent=2, sort_keys=True),
-    )
+    locale = str(data.get("locale") or "ru")
     await message.answer(
         _confirmation_text(data),
         reply_markup=keyboard(
             [
-                ("Рассчитать", "confirm:calculate"),
-                ("Изменить климат", "confirm:climate"),
-                ("Изменить стены", "confirm:walls"),
-                ("Изменить проёмы", "confirm:openings"),
-                ("Изменить пол/потолок", "confirm:boundaries"),
-                ("Изменить вентиляцию", "confirm:airflow"),
-                ("Отмена", "nav:cancel"),
+                (tr("survey.confirm.calculate", locale), "confirm:calculate"),
+                (tr("survey.confirm.climate", locale), "confirm:climate"),
+                (tr("survey.confirm.walls", locale), "confirm:walls"),
+                (tr("survey.confirm.openings", locale), "confirm:openings"),
+                (tr("survey.confirm.boundaries", locale), "confirm:boundaries"),
+                (tr("survey.confirm.airflow", locale), "confirm:airflow"),
+                (tr("common.cancel", locale), "nav:cancel"),
             ],
             1,
             navigation=False,
+            locale=locale,
         ),
     )
 
@@ -1864,10 +2160,14 @@ async def safety_factor(
     try:
         factor = float(callback.data.split(":", 1)[1])
     except (IndexError, ValueError):
-        await callback.answer("Некорректный коэффициент запаса", show_alert=True)
+        await callback.answer(
+            tr("common.invalid_option", await _state_locale(state)), show_alert=True
+        )
         return
     if factor not in {1.0, 1.10, 1.15, 1.20}:
-        await callback.answer("Неизвестный коэффициент запаса", show_alert=True)
+        await callback.answer(
+            tr("common.invalid_option", await _state_locale(state)), show_alert=True
+        )
         return
     await state.update_data(safety_factor=factor)
     await _ask_confirmation(callback.message, state)
@@ -1886,18 +2186,7 @@ async def confirmation(
         await callback.answer()
         return
     if action == "walls":
-        await state.set_state(Survey.wall_method)
-        await callback.message.answer(
-            "Измените способ задания наружных стен:",
-            reply_markup=keyboard(
-                [
-                    ("Общая площадь", "walls:area"),
-                    ("Размеры одной стены", "walls:dimensions"),
-                    ("Группы стен (экспертный импорт)", "walls:groups"),
-                ],
-                1,
-            ),
-        )
+        await _ask_wall_method(callback.message, state)
         await callback.answer()
         return
     if action == "openings":
@@ -1905,19 +2194,7 @@ async def confirmation(
         await callback.answer()
         return
     if action == "boundaries":
-        await state.set_state(Survey.floor_boundary)
-        await callback.message.answer(
-            "Измените условие под полом:",
-            reply_markup=keyboard(
-                [
-                    ("Отапливаемый сосед", "floor:heated"),
-                    ("Холодный подвал", "floor:unheated"),
-                    ("Грунт", "floor:ground"),
-                    ("Наружный воздух", "floor:outdoor"),
-                ],
-                1,
-            ),
-        )
+        await _ask_floor_boundary(callback.message, state)
         await callback.answer()
         return
     if action == "airflow":
@@ -1925,17 +2202,18 @@ async def confirmation(
         await callback.answer()
         return
     if action != "calculate":
-        await callback.answer("Неизвестное действие", show_alert=True)
+        await callback.answer(
+            tr("survey.confirm.error.action", await _state_locale(state)), show_alert=True
+        )
         return
 
     state_data = await state.get_data()
     data = {key: value for key, value in state_data.items() if not key.startswith("_")}
+    locale = str(data.get("locale") or "ru")
     try:
         bundle = calculate_from_answers(data)
     except InvalidCalculationData as exc:
-        await callback.message.answer(
-            f"⚠️ Не удалось завершить расчёт: {exc}. Запустите /new и проверьте исходные данные."
-        )
+        await callback.message.answer(tr("result.invalid", locale, message=str(exc)))
         await callback.answer()
         return
 
@@ -1944,10 +2222,7 @@ async def confirmation(
             "Unexpected calculation failure user_id=%s",
             callback.from_user.id,
         )
-        await callback.message.answer(
-            "Не удалось завершить расчёт из-за внутренней ошибки. "
-            "Данные не сохранены; попробуйте /new или сообщите администратору."
-        )
+        await callback.message.answer(tr("result.internal", locale))
         await callback.answer()
         return
 
@@ -1961,6 +2236,7 @@ async def confirmation(
         "report": bundle.report,
     }
 
+    calculation_id: int | None = None
     try:
         calculation_id = await asyncio.to_thread(
             repository.save,
@@ -1976,38 +2252,64 @@ async def confirmation(
         logger.exception("Database save failed user_id=%s", callback.from_user.id)
         await _send_long_message(
             callback.message,
-            "⚠️ Расчёт выполнен, но не сохранён в истории.\n\n" + bundle.report,
+            tr("result.unsaved", locale)
+            + "\n\n"
+            + format_telegram_summary(
+                str(data.get("object_name") or tr("summary.untitled", locale)),
+                bundle.building,
+                bundle.result,
+                bundle.climate,
+                str(data.get("scenario") or "manual"),
+                str(data.get("locale") or "ru"),
+            ),
         )
     else:
         await _send_long_message(
             callback.message,
-            f"Расчёт №{calculation_id}\n\n{bundle.report}",
+            tr("result.saved", locale, id=calculation_id)
+            + "\n\n"
+            + format_telegram_summary(
+                str(data.get("object_name") or tr("summary.untitled", locale)),
+                bundle.building,
+                bundle.result,
+                bundle.climate,
+                str(data.get("scenario") or "manual"),
+                str(data.get("locale") or "ru"),
+            ),
         )
     try:
         from ..pdf_report import build_pdf_report
 
+        data["calculation_id"] = calculation_id or "unsaved"
         pdf_bytes = await asyncio.to_thread(
             build_pdf_report,
             bundle,
             data,
             callback.from_user.id,
         )
+        safe_id = str(calculation_id) if calculation_id is not None else "unsaved"
         await callback.message.answer_document(
-            BufferedInputFile(pdf_bytes, filename=f"u-calc-{calculation_id}.pdf"),
-            caption="PDF-отчёт U-Calc",
+            BufferedInputFile(pdf_bytes, filename=f"u-calc-{safe_id}.pdf"),
+            caption=tr("result.pdf_caption", locale),
         )
     except Exception:
         logger.exception("PDF generation failed user_id=%s", callback.from_user.id)
-        await callback.message.answer(
-            "Текстовый расчёт готов, но PDF создать не удалось. Данные расчёта сохранены."
-        )
-    await callback.message.answer("Новый расчёт: /new")
+        await callback.message.answer(tr("result.pdf_failed", locale))
+    await callback.message.answer(tr("result.new", locale))
     await state.clear()
     await callback.answer()
 
 
+@router.callback_query()
+async def stale_callback(callback: CallbackQuery, repository: CalculationRepository) -> None:
+    settings = await asyncio.to_thread(repository.get_user_settings, callback.from_user.id)
+    await callback.answer(tr("common.stale", settings.locale), show_alert=True)
+
+
 @router.errors()
-async def global_error_handler(event: ErrorEvent) -> bool:
+async def global_error_handler(
+    event: ErrorEvent, repository: CalculationRepository
+) -> bool:
     update = event.update
     message = update.message
     callback = update.callback_query
@@ -2019,13 +2321,17 @@ async def global_error_handler(event: ErrorEvent) -> bool:
         update.update_id,
         exc_info=(type(exception), exception, exception.__traceback__),
     )
-    text = (
-        "Не удалось обработать этот шаг. Данные расчёта могли сохраниться не полностью. "
-        "Попробуйте ещё раз или начните заново командой /new."
-    )
+    locale = "ru"
+    if user is not None:
+        try:
+            settings = await asyncio.to_thread(repository.get_user_settings, user.id)
+            locale = settings.locale
+        except Exception:
+            logger.exception("Failed to resolve locale for error notification")
+    text = tr("common.unhandled", locale)
     try:
         if callback:
-            await callback.answer("Внутренняя ошибка", show_alert=True)
+            await callback.answer(tr("common.internal", locale), show_alert=True)
             if callback.message:
                 await callback.message.answer(text)
         elif message:

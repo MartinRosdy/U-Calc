@@ -1,5 +1,14 @@
-from .catalog import CATALOG_VERSION, ENGINE_VERSION, MATERIALS, SCENARIO_NAMES, ClimateProfile
-from .models import Boundary, Building, HeatLossResult, Layer, OpaqueSurface
+from .catalog import (
+    CATALOG_VERSION,
+    CLIMATES,
+    ENGINE_VERSION,
+    MATERIALS,
+    SCENARIO_NAMES,
+    ClimateProfile,
+)
+from .i18n import normalize_locale
+from .i18n import translate as tr
+from .models import Boundary, Building, HeatLossResult, Layer, OpaqueSurface, Orientation
 
 BOUNDARY_NAMES = {
     Boundary.OUTDOOR: "наружный воздух",
@@ -7,6 +16,135 @@ BOUNDARY_NAMES = {
     Boundary.GROUND: "грунт",
     Boundary.HEATED: "отапливаемое помещение",
 }
+
+ORIENTATION_NAMES = {
+    Orientation.NORTH: "север",
+    Orientation.NORTH_EAST: "северо-восток",
+    Orientation.EAST: "восток",
+    Orientation.SOUTH_EAST: "юго-восток",
+    Orientation.SOUTH: "юг",
+    Orientation.SOUTH_WEST: "юго-запад",
+    Orientation.WEST: "запад",
+    Orientation.NORTH_WEST: "северо-запад",
+}
+
+
+def format_telegram_summary(
+    object_name: str,
+    building: Building,
+    result: HeatLossResult,
+    climate: ClimateProfile | None = None,
+    scenario: str = "design",
+    locale: str = "ru",
+) -> str:
+    """Return the short client-facing result; engineering details stay in the PDF."""
+    locale = normalize_locale(locale)
+    categories = {
+        "walls": 0.0,
+        "openings": 0.0,
+        "boundaries": 0.0,
+        "airflow": 0.0,
+        "bridges": 0.0,
+    }
+    for line in result.lines:
+        lowered = line.name.casefold()
+        if line.kind in {"Поправка", "Линейный мостик"}:
+            category = "bridges"
+        elif line.kind.startswith("Вентиляция") or line.kind in {
+            "Инфильтрация",
+            "Естественная вентиляция",
+        }:
+            category = "airflow"
+        elif line.kind == "Проём":
+            category = "openings"
+        elif line.kind == "Пол по грунту" or any(
+            word in lowered for word in ("пол", "потолок", "кровл", "чердак")
+        ):
+            category = "boundaries"
+        else:
+            category = "walls"
+        categories[category] += line.watts
+
+    lines = [
+        tr("summary.ready", locale, name=object_name),
+        "",
+        tr("summary.load", locale, value=f"{result.total_kw:.2f}"),
+        tr(
+            "summary.range",
+            locale,
+            minimum=f"{result.total_kw:.2f}",
+            maximum=f"{result.recommended_kw:.2f}",
+        ),
+        tr("summary.reserve", locale, value=f"{(building.safety_factor - 1) * 100:.0f}"),
+    ]
+    if climate:
+        scenario_name = (
+            tr(f"survey.scenario.{scenario}", locale)
+            if scenario in {"economy", "design", "extreme", "future"}
+            else SCENARIO_NAMES.get(scenario, scenario)
+        )
+        city = tr(f"climate.{climate.key}", locale) if climate.key in CLIMATES else climate.name
+        lines.append(
+            tr(
+                "summary.temperature",
+                locale,
+                value=f"{building.outdoor_temperature_c:g}",
+                scenario=scenario_name,
+                city=city,
+            )
+        )
+    else:
+        lines.append(
+            tr(
+                "summary.temperature_manual",
+                locale,
+                value=f"{building.outdoor_temperature_c:g}",
+            )
+        )
+
+    lines.extend(["", tr("summary.destinations", locale)])
+    for label, watts in categories.items():
+        if watts <= 0:
+            continue
+        percent = watts / result.total_w * 100 if result.total_w else 0.0
+        lines.append(
+            tr(
+                "summary.category.line",
+                locale,
+                name=tr(f"summary.category.{label}", locale),
+                value=f"{watts / 1000:.2f}",
+                percent=f"{percent:.0f}",
+            )
+        )
+
+    warnings: list[str] = []
+    if climate is None:
+        warnings.append(tr("summary.warning.manual_climate", locale))
+    if any(opening.value_status != "passport" for opening in building.openings):
+        warnings.append(tr("summary.warning.openings", locale))
+    if any(
+        layer.conductivity_w_mk is None
+        and MATERIALS[layer.material_key].value_status != "normative_design"
+        for surface in building.opaque_surfaces
+        for layer in surface.layers
+        if layer.material_key in MATERIALS
+    ):
+        warnings.append(tr("summary.warning.materials", locale))
+    if building.assumptions:
+        if locale == "ru":
+            warnings.extend(building.assumptions[:3])
+        else:
+            warnings.append(tr("summary.warning.assumptions", locale))
+    if warnings:
+        lines.extend(["", tr("summary.warning.title", locale)])
+        lines.extend(f"• {warning}" for warning in dict.fromkeys(warnings))
+    lines.extend(
+        [
+            "",
+            tr("summary.footer", locale),
+        ]
+    )
+    return "\n".join(lines)
 
 
 def _layer_description(layer: Layer) -> str:
@@ -29,9 +167,14 @@ def _surface_description(surface: OpaqueSurface) -> str:
     layers = ", ".join(_layer_description(layer) for layer in surface.layers)
     if not layers:
         layers = "тепловой поток принят равным нулю"
+    orientation = (
+        f"; ориентация {ORIENTATION_NAMES[surface.orientation]}"
+        if surface.orientation is not None
+        else ""
+    )
     return (
         f"• {surface.name}: {surface.area_m2:g} м² → {boundary}; {layers}; "
-        f"β={surface.additional_heat_loss_factor:g}; n={surface.position_factor:g}"
+        f"β={surface.additional_heat_loss_factor:g}; n={surface.position_factor:g}{orientation}"
     )
 
 
@@ -98,10 +241,16 @@ def format_report(
     lines.extend(["", "Конструкции:"])
     lines.extend(_surface_description(surface) for surface in building.opaque_surfaces)
     for opening in building.openings:
+        orientation = (
+            f"; ориентация {ORIENTATION_NAMES[opening.orientation]}"
+            if opening.orientation is not None
+            else ""
+        )
         lines.append(
             f"• {opening.name}: {opening.area_m2:g} м²; U={opening.u_value:g} Вт/(м²·К); "
             f"{opening.value_status}; {opening.source_note}; "
             f"β={opening.additional_heat_loss_factor:g}; n={opening.position_factor:g}"
+            f"{orientation}"
         )
     if building.ground_floor_zones:
         lines.append(

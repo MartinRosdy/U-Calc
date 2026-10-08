@@ -161,3 +161,67 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(first, repeated)
             self.assertNotEqual(first, other_user)
             self.assertEqual(len(repository.recent(100)), 1)
+
+    def test_user_locale_and_profile_crud_are_private(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = CalculationRepository(Path(directory) / "profiles.db")
+            repository.initialize()
+            self.assertEqual(repository.get_user_settings(100).locale, "ru")
+            repository.set_locale(100, "uz")
+            self.assertEqual(repository.get_user_settings(100).locale, "uz")
+            repository.set_prepared_by(100, "ООО Тепло")
+            self.assertEqual(repository.get_user_settings(100).prepared_by, "ООО Тепло")
+            with self.assertRaises(ValueError):
+                repository.set_prepared_by(100, "x" * 121)
+
+            first = repository.create_profile(
+                100,
+                "Uy",
+                {"indoor": 24, "safety_factor": 1.1},
+                make_default=True,
+            )
+            self.assertTrue(first.is_default)
+            self.assertTrue(
+                repository.update_profile_settings(
+                    100,
+                    first.id,
+                    {"indoor": 22, "air_changes": 0.8, "safety_factor": 1.15},
+                )
+            )
+            updated = repository.get_profile(100, first.id)
+            self.assertEqual(updated.settings["indoor"], 22.0)
+            self.assertEqual(updated.version, first.version + 1)
+            self.assertFalse(
+                repository.update_profile_settings(
+                    200,
+                    first.id,
+                    {"indoor": 22, "air_changes": 0.8, "safety_factor": 1.15},
+                )
+            )
+            with self.assertRaises(ValueError):
+                repository.update_profile_settings(
+                    100,
+                    first.id,
+                    {"indoor": float("nan"), "air_changes": 0.8, "safety_factor": 1.15},
+                )
+            self.assertEqual(repository.get_user_settings(100).default_profile_id, first.id)
+            self.assertIsNone(repository.get_profile(200, first.id))
+
+            copied = repository.duplicate_profile(100, first.id, "Uy nusxasi")
+            self.assertEqual(copied.settings, updated.settings)
+            self.assertTrue(repository.rename_profile(100, copied.id, "Kvartira"))
+            self.assertTrue(repository.set_default_profile(100, copied.id))
+            profiles = repository.list_profiles(100)
+            self.assertEqual(sum(profile.is_default for profile in profiles), 1)
+            self.assertEqual(profiles[0].name, "Kvartira")
+            self.assertFalse(repository.delete_profile(200, copied.id))
+            self.assertTrue(repository.delete_profile(100, copied.id))
+            self.assertIsNone(repository.get_user_settings(100).default_profile_id)
+
+    def test_profile_names_are_unique_case_insensitively(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = CalculationRepository(Path(directory) / "profiles.db")
+            repository.initialize()
+            repository.create_profile(100, "Дом")
+            with self.assertRaisesRegex(ValueError, "уже существует"):
+                repository.create_profile(100, "дом")

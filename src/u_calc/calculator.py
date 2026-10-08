@@ -8,6 +8,7 @@ from .models import (
     HeatLossResult,
     LossLine,
     OpaqueSurface,
+    Orientation,
     SurfaceKind,
 )
 
@@ -30,6 +31,24 @@ BOUNDARY_FACTORS = {
 }
 
 GROUND_ZONE_RESISTANCES = (2.1, 4.3, 8.5, 14.2)
+
+# SHNQ 2.04.05-22, appendix 9, clause 2(a), current revision 07.07.2026.
+# South and south-west are not assigned an orientation increment by this clause.
+ORIENTATION_HEAT_LOSS_FACTORS = {
+    Orientation.NORTH: 0.10,
+    Orientation.NORTH_EAST: 0.10,
+    Orientation.EAST: 0.10,
+    Orientation.SOUTH_EAST: 0.05,
+    Orientation.SOUTH: 0.0,
+    Orientation.SOUTH_WEST: 0.0,
+    Orientation.WEST: 0.05,
+    Orientation.NORTH_WEST: 0.10,
+}
+
+
+def orientation_heat_loss_factor(orientation: Orientation | None) -> float:
+    """Return the normative orientation increment, or zero when it is unknown."""
+    return ORIENTATION_HEAT_LOSS_FACTORS.get(orientation, 0.0)
 
 
 def ground_floor_zones(

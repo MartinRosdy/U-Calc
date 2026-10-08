@@ -17,6 +17,7 @@ class Settings:
     app_timezone: str = "Asia/Tashkent"
     allowed_user_ids: frozenset[int] = frozenset()
     rate_limit_per_minute: int = 30
+    calculation_rate_limit_per_minute: int = 6
     max_message_length: int = 4096
     history_retention_days: int = 730
     draft_ttl_days: int = 30
@@ -41,6 +42,7 @@ class Settings:
 
         allowed_user_ids = _parse_user_ids(os.getenv("ALLOWED_USER_IDS", ""))
         rate_limit = _bounded_int("RATE_LIMIT_PER_MINUTE", 30, 5, 300)
+        calculation_rate_limit = _bounded_int("CALCULATION_RATE_LIMIT_PER_MINUTE", 6, 1, 60)
         max_message_length = _bounded_int("MAX_MESSAGE_LENGTH", 4096, 100, 4096)
         history_retention_days = _bounded_int("HISTORY_RETENTION_DAYS", 730, 1, 3650)
         draft_ttl_days = _bounded_int("DRAFT_TTL_DAYS", 30, 1, 365)
@@ -51,6 +53,7 @@ class Settings:
             app_timezone=timezone_name,
             allowed_user_ids=allowed_user_ids,
             rate_limit_per_minute=rate_limit,
+            calculation_rate_limit_per_minute=calculation_rate_limit,
             max_message_length=max_message_length,
             history_retention_days=history_retention_days,
             draft_ttl_days=draft_ttl_days,

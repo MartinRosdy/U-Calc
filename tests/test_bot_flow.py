@@ -85,7 +85,7 @@ class ApartmentFlowTests(unittest.IsolatedAsyncioTestCase):
                 "Изменить проёмы",
                 "Изменить пол/потолок",
                 "Изменить вентиляцию",
-                "Отмена",
+                "✖️ Отменить",
             ],
         )
 

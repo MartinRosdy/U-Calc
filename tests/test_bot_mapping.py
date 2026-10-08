@@ -228,6 +228,7 @@ class BotMappingTests(unittest.TestCase):
             "wall_groups": [
                 {
                     "name": "Север",
+                    "orientation": "north",
                     "gross_area_m2": 30,
                     "material": "brick_solid",
                     "thickness_m": 0.25,
@@ -241,6 +242,15 @@ class BotMappingTests(unittest.TestCase):
                     "thickness_m": 0.30,
                     "insulation_material": None,
                     "insulation_thickness_m": 0,
+                    "layers": [
+                        {"material": "brick_hollow", "thickness_m": 0.12},
+                        {
+                            "material": "custom",
+                            "material_conductivity": 0.04,
+                            "thickness_m": 0.08,
+                        },
+                        {"material": "aerated_d500", "thickness_m": 0.20},
+                    ],
                 },
             ],
             "wall_gross_area": 50,
@@ -262,12 +272,17 @@ class BotMappingTests(unittest.TestCase):
         self.assertEqual([wall.name for wall in walls], ["Стена: Север", "Стена: Торец"])
         self.assertAlmostEqual(sum(wall.area_m2 for wall in walls), 40)
         self.assertNotEqual(walls[0].layers, walls[1].layers)
+        self.assertEqual(
+            [layer.material_key for layer in walls[1].layers],
+            ["brick_hollow", "custom", "aerated_d500"],
+        )
 
     def test_window_groups_are_deducted_from_their_selected_walls(self) -> None:
         data = {
             "wall_groups": [
                 {
                     "name": "Север",
+                    "orientation": "north",
                     "gross_area_m2": 30,
                     "material": "brick_solid",
                     "thickness_m": 0.25,
@@ -314,6 +329,75 @@ class BotMappingTests(unittest.TestCase):
         self.assertEqual(walls[1].area_m2, 20)
         self.assertEqual(building.openings[0].u_value, 1.1)
         self.assertEqual(building.openings[0].name, "Северные окна (2 шт.)")
+        self.assertEqual(walls[0].orientation, "north")
+        self.assertEqual(walls[0].additional_heat_loss_factor, 0.1)
+        self.assertEqual(building.openings[0].orientation, "north")
+        self.assertEqual(building.openings[0].additional_heat_loss_factor, 0.1)
+        self.assertFalse(building.assumptions)
+
+    def test_unassigned_opening_discloses_distribution_and_zero_orientation_factor(self) -> None:
+        data = {
+            "wall_groups": [
+                {
+                    "name": "Север",
+                    "orientation": "north",
+                    "gross_area_m2": 30,
+                    "material": "brick_solid",
+                    "thickness_m": 0.25,
+                    "insulation_material": None,
+                    "insulation_thickness_m": 0,
+                }
+            ],
+            "wall_gross_area": 30,
+            "window_count": 1,
+            "window_area": 3,
+            "window_type": "double",
+            "door_area": 0,
+            "length": 5,
+            "width": 4,
+            "floor_boundary": "heated",
+            "ceiling_boundary": "heated",
+            "indoor": 24,
+            "outdoor": -14,
+            "volume": 60,
+            "air_changes": 0.5,
+        }
+
+        building = _build_from_answers(data)
+
+        self.assertEqual(building.openings[0].additional_heat_loss_factor, 0)
+        self.assertIsNone(building.openings[0].orientation)
+        self.assertTrue(any("β=0" in item for item in building.assumptions))
+
+    def test_wall_groups_without_openings_do_not_create_distribution_assumption(self) -> None:
+        data = {
+            "wall_groups": [
+                {
+                    "name": "Север",
+                    "orientation": "north",
+                    "gross_area_m2": 30,
+                    "material": "brick_solid",
+                    "thickness_m": 0.25,
+                    "insulation_material": None,
+                    "insulation_thickness_m": 0,
+                }
+            ],
+            "wall_gross_area": 30,
+            "window_count": 0,
+            "window_area": 0,
+            "door_area": 0,
+            "length": 5,
+            "width": 4,
+            "floor_boundary": "heated",
+            "ceiling_boundary": "heated",
+            "indoor": 24,
+            "outdoor": -14,
+            "volume": 60,
+            "air_changes": 0.5,
+        }
+
+        building = _build_from_answers(data)
+
         self.assertFalse(building.assumptions)
 
 

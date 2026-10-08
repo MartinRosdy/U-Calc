@@ -26,7 +26,7 @@ jobs:
       - run: git diff --exit-code -- requirements.txt
       - run: ruff check src tests scripts main.py
       - run: coverage run -m pytest -q
-      - run: coverage report --fail-under=70
+      - run: coverage report --fail-under=85
       - run: python -m compileall -q src tests scripts main.py
       - run: python -m build
       - run: u-calc-demo > /tmp/u-calc-demo.txt
@@ -44,3 +44,14 @@ jobs:
           tags: u-calc:ci
           load: true
       - run: docker run --rm --entrypoint python u-calc:ci -c "import u_calc.pdf_report; print('docker-smoke-ok')"
+      - name: Verify non-root runtime and installed command
+        run: |
+          test "$(docker run --rm u-calc:ci id -u)" = "100"
+          docker run --rm u-calc:ci u-calc-demo > /tmp/u-calc-container-demo.txt
+          test -s /tmp/u-calc-container-demo.txt
+      - name: Verify persistent SQLite volume and current schema
+        run: |
+          docker volume create u-calc-ci-data
+          trap 'docker volume rm u-calc-ci-data' EXIT
+          docker run --rm -v u-calc-ci-data:/app/data u-calc:ci python -c "from pathlib import Path; from u_calc.storage import CalculationRepository, SCHEMA_VERSION; r=CalculationRepository(Path('/app/data/u_calc.db')); r.initialize(); assert r.schema_version() == SCHEMA_VERSION"
+          docker run --rm -v u-calc-ci-data:/app/data u-calc:ci test -s /app/data/u_calc.db

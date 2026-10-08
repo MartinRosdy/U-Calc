@@ -46,6 +46,7 @@ class SettingsTests(unittest.TestCase):
             {
                 "BOT_TOKEN": "123:secret",
                 "RATE_LIMIT_PER_MINUTE": "12",
+                "CALCULATION_RATE_LIMIT_PER_MINUTE": "3",
                 "MAX_MESSAGE_LENGTH": "2000",
                 "HISTORY_RETENTION_DAYS": "365",
                 "DRAFT_TTL_DAYS": "14",
@@ -54,6 +55,7 @@ class SettingsTests(unittest.TestCase):
         ):
             settings = Settings.from_env()
         self.assertEqual(settings.rate_limit_per_minute, 12)
+        self.assertEqual(settings.calculation_rate_limit_per_minute, 3)
         self.assertEqual(settings.max_message_length, 2000)
         self.assertEqual(settings.history_retention_days, 365)
         self.assertEqual(settings.draft_ttl_days, 14)
@@ -65,6 +67,16 @@ class SettingsTests(unittest.TestCase):
                 clear=True,
             ),
             self.assertRaisesRegex(RuntimeError, "RATE_LIMIT_PER_MINUTE"),
+        ):
+            Settings.from_env()
+
+        with (
+            patch.dict(
+                os.environ,
+                {"BOT_TOKEN": "123:secret", "CALCULATION_RATE_LIMIT_PER_MINUTE": "61"},
+                clear=True,
+            ),
+            self.assertRaisesRegex(RuntimeError, "CALCULATION_RATE_LIMIT_PER_MINUTE"),
         ):
             Settings.from_env()
 

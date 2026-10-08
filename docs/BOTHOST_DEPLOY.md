@@ -26,6 +26,7 @@ Production-профиль: собственный Dockerfile, Telegram long poll
 - `APP_TIMEZONE=Asia/Tashkent`;
 - `ALLOWED_USER_IDS=123456789,987654321` для закрытого запуска;
 - `RATE_LIMIT_PER_MINUTE=30`;
+- `CALCULATION_RATE_LIMIT_PER_MINUTE=6`;
 - `MAX_MESSAGE_LENGTH=4096`;
 - `HISTORY_RETENTION_DAYS=730`;
 - `DRAFT_TTL_DAYS=30`.

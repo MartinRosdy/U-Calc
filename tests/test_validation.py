@@ -61,6 +61,21 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "уже использовано"):
             parse_wall_groups("Север | 20 | кирпич | 25\nсЕвЕр | 15 | газоблок | 30")
 
+    def test_explicit_wall_layers_are_strictly_validated(self) -> None:
+        data = base_answers()
+        data["wall_groups"] = [
+            {
+                "name": "Север",
+                "gross_area_m2": 60,
+                "layers": ["повреждённый слой"],
+            }
+        ]
+        with self.assertRaisesRegex(InvalidCalculationData, "слой стены"):
+            build_from_answers(data)
+        data["wall_groups"][0]["layers"] = [{"material": "brick_solid", "thickness_m": 0.1}] * 11
+        with self.assertRaisesRegex(InvalidCalculationData, "от 1 до 10"):
+            build_from_answers(data)
+
     def test_door_groups_preserve_count_area_u_and_wall(self) -> None:
         groups = parse_door_groups("Входная | 2 | 0,9x2,1 | 1,4 | Север")
         self.assertEqual(groups[0]["count"], 2)

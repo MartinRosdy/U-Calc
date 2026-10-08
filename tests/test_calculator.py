@@ -18,6 +18,7 @@ from u_calc.models import (
     LinearThermalBridge,
     OpaqueSurface,
     Opening,
+    Orientation,
     SurfaceKind,
 )
 
@@ -393,6 +394,25 @@ class CalculatorTests(unittest.TestCase):
         base_loss = calculate_heat_loss(Building(opaque_surfaces=(base,), **common)).total_w
         factored_loss = calculate_heat_loss(Building(opaque_surfaces=(factored,), **common)).total_w
         self.assertAlmostEqual(factored_loss, base_loss * 1.1 * 0.9)
+
+    def test_orientation_factors_match_shnq_appendix_9_clause_2(self) -> None:
+        from u_calc.calculator import orientation_heat_loss_factor
+
+        expected = {
+            Orientation.NORTH: 0.10,
+            Orientation.NORTH_EAST: 0.10,
+            Orientation.EAST: 0.10,
+            Orientation.SOUTH_EAST: 0.05,
+            Orientation.SOUTH: 0.0,
+            Orientation.SOUTH_WEST: 0.0,
+            Orientation.WEST: 0.05,
+            Orientation.NORTH_WEST: 0.10,
+        }
+        self.assertEqual(
+            {orientation: orientation_heat_loss_factor(orientation) for orientation in expected},
+            expected,
+        )
+        self.assertEqual(orientation_heat_loss_factor(None), 0.0)
 
 
 if __name__ == "__main__":
