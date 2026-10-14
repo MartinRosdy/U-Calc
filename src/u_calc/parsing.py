@@ -1,33 +1,48 @@
 import math
 import re
+import unicodedata
 from typing import Any
 
 MATERIAL_ALIASES = {
     "кирпич": "brick_solid",
     "полнотелый кирпич": "brick_solid",
+    "g‘isht": "brick_solid",
+    "g'isht": "brick_solid",
+    "to‘liq g‘isht": "brick_solid",
+    "to'liq g'isht": "brick_solid",
     "brick_solid": "brick_solid",
     "пустотелый кирпич": "brick_hollow",
+    "g‘ovak g‘isht": "brick_hollow",
+    "g'ovak g'isht": "brick_hollow",
     "brick_hollow": "brick_hollow",
     "газоблок": "aerated_d500",
     "газобетон": "aerated_d500",
+    "gazoblok": "aerated_d500",
+    "gazobeton": "aerated_d500",
     "aerated_d500": "aerated_d500",
     "бетон": "concrete",
     "железобетон": "concrete",
+    "beton": "concrete",
+    "temirbeton": "concrete",
     "concrete": "concrete",
     "дерево": "wood",
     "древесина": "wood",
+    "yog‘och": "wood",
+    "yog'och": "wood",
     "wood": "wood",
     "минвата": "mineral_wool",
     "каменная вата": "mineral_wool",
+    "mineral paxta": "mineral_wool",
+    "tosh paxta": "mineral_wool",
     "mineral_wool": "mineral_wool",
     "пенопласт": "eps",
     "пенополистирол": "eps",
+    "penoplast": "eps",
+    "penopolistirol": "eps",
     "eps": "eps",
     "эппс": "xps",
+    "epps": "xps",
     "xps": "xps",
-    "ппу": "pu_foam",
-    "пенополиуретан": "pu_foam",
-    "pu_foam": "pu_foam",
 }
 
 
@@ -100,8 +115,7 @@ def parse_wall_groups(value: str | None) -> list[dict[str, Any]]:
                 f"строка {line_number}: нужно 4 поля без утепления или 6 полей с утеплением"
             )
         name, area_text, material_text, thickness_text = fields[:4]
-        if not name:
-            raise ValueError(f"строка {line_number}: укажите название стены")
+        name = _bounded_label(name, line_number, "название стены")
         folded_name = name.casefold()
         if folded_name in names:
             raise ValueError(f"строка {line_number}: название стены «{name}» уже использовано")
@@ -112,13 +126,19 @@ def parse_wall_groups(value: str | None) -> list[dict[str, Any]]:
         insulation_material = None
         insulation_conductivity = None
         insulation_thickness_m = 0.0
-        if len(fields) == 6 and fields[4].lower() not in {"-", "нет", "no"}:
+        if len(fields) == 6 and fields[4].lower() not in {
+            "-",
+            "нет",
+            "no",
+            "yo‘q",
+            "yo'q",
+            "yoq",
+        }:
             insulation_material, insulation_conductivity = _material_spec(fields[4], line_number)
             if insulation_conductivity is None and insulation_material not in {
                 "mineral_wool",
                 "eps",
                 "xps",
-                "pu_foam",
             }:
                 raise ValueError(f"строка {line_number}: пятый столбец должен быть утеплителем")
             insulation_thickness_m = (
@@ -130,7 +150,7 @@ def parse_wall_groups(value: str | None) -> list[dict[str, Any]]:
             )
         result.append(
             {
-                "name": name[:60],
+                "name": name,
                 "gross_area_m2": area,
                 "material": material_key,
                 "material_conductivity": material_conductivity,
@@ -180,19 +200,158 @@ def parse_linear_thermal_bridges(value: str | None) -> list[dict[str, Any]]:
     """Parse `name | length m | psi W/(m·K)` rows."""
     value = _require_text(value)
     result: list[dict[str, Any]] = []
+    names: set[str] = set()
     for line_number, raw_line in enumerate(value.strip().splitlines(), start=1):
         if not raw_line.strip():
             continue
         fields = [item.strip() for item in raw_line.split("|")]
         if len(fields) != 3 or not fields[0]:
             raise ValueError(f"строка {line_number}: формат Название | длина | ψ")
+        name = _bounded_label(fields[0], line_number, "название мостика")
+        folded_name = name.casefold()
+        if folded_name in names:
+            raise ValueError(f"строка {line_number}: название мостика «{name}» уже использовано")
+        names.add(folded_name)
         length_m = parse_number(fields[1], minimum=0.01, maximum=10_000, label="Длина мостика")
-        psi = _parse_nonnegative(fields[2], "ψ")
-        result.append({"name": fields[0][:60], "length_m": length_m, "psi_w_mk": psi})
+        psi = parse_number(fields[2], minimum=0, maximum=5, label="ψ")
+        result.append({"name": name, "length_m": length_m, "psi_w_mk": psi})
     if not result:
         raise ValueError("укажите хотя бы один мостик холода")
     if len(result) > 30:
         raise ValueError("за один расчёт можно задать не более 30 мостиков холода")
+    return result
+
+
+def parse_appendix8_infiltration_paths(value: str | None) -> list[dict[str, float]]:
+    """Parse Appendix 8 formula (3) pressure groups separated by newlines.
+
+    Columns: delta_pi | delta_p1 | A1 | Ru | A2 | Gn | A3 | l.
+    """
+    value = _require_text(value)
+    result: list[dict[str, float]] = []
+    for line_number, raw_line in enumerate(value.strip().splitlines(), start=1):
+        if not raw_line.strip():
+            continue
+        fields = [item.strip() for item in raw_line.split("|")]
+        if len(fields) != 8:
+            raise ValueError(f"строка {line_number}: требуется 8 значений через символ |")
+        limits = (
+            (0.01, 5_000.0, "Δpi"),
+            (0.01, 5_000.0, "Δp1"),
+            (0.0, 100_000.0, "A1"),
+            (0.0, 1_000_000.0, "Ru"),
+            (0.0, 1_000_000.0, "A2"),
+            (0.0, 10_000.0, "Gn"),
+            (0.0, 10_000.0, "A3"),
+            (0.0, 1_000_000.0, "l"),
+        )
+        numbers = [
+            parse_number(field, minimum=minimum, maximum=maximum, label=label)
+            for field, (minimum, maximum, label) in zip(fields, limits, strict=True)
+        ]
+        pressure, first_pressure, a1, resistance, a2, permeability, a3, joints = numbers
+        if a1 > 0 and resistance <= 0:
+            raise ValueError(f"строка {line_number}: при A1 больше нуля Ru должно быть больше нуля")
+        if a2 > 0 and permeability <= 0:
+            raise ValueError(f"строка {line_number}: при A2 больше нуля Gn должно быть больше нуля")
+        if not any((a1, a2, a3, joints)):
+            raise ValueError(f"строка {line_number}: задайте хотя бы A1, A2, A3 или l")
+        result.append(
+            {
+                "pressure_pa": pressure,
+                "first_floor_pressure_pa": first_pressure,
+                "opening_area_m2": a1,
+                "air_permeability_resistance_m2_h_pa_kg": resistance,
+                "envelope_area_m2": a2,
+                "normative_air_permeability_kg_m2_h": permeability,
+                "gap_area_m2": a3,
+                "panel_joint_length_m": joints,
+            }
+        )
+    if not result:
+        raise ValueError("укажите хотя бы одну группу ограждений")
+    if len(result) > 50:
+        raise ValueError("допустимо не более 50 групп давления")
+    return result
+
+
+def parse_appendix8_pressure_globals(value: str | None) -> dict[str, float]:
+    """Parse shared expert inputs for Appendix 8 formula (4)."""
+    fields = [item.strip() for item in _require_text(value).split("|")]
+    if len(fields) != 7:
+        raise ValueError("требуется 7 значений через символ |")
+    limits = (
+        (0.01, 1_000.0, "H"),
+        (0.5, 2.0, "ρн"),
+        (0.0, 100.0, "v"),
+        (-5.0, 5.0, "cₑ,n"),
+        (-5.0, 5.0, "cₑ,p"),
+        (0.0, 10.0, "k₁"),
+        (-5_000.0, 5_000.0, "pᵢnt"),
+    )
+    numbers = [
+        parse_number(field, minimum=minimum, maximum=maximum, label=label)
+        for field, (minimum, maximum, label) in zip(fields, limits, strict=True)
+    ]
+    keys = (
+        "building_height_m",
+        "outdoor_air_density_kg_m3",
+        "wind_speed_m_s",
+        "windward_coefficient",
+        "leeward_coefficient",
+        "height_factor",
+        "internal_pressure_pa",
+    )
+    return dict(zip(keys, numbers, strict=True))
+
+
+def parse_appendix8_pressure_groups(value: str | None) -> list[dict[str, float]]:
+    """Parse heights and permeability terms for formulae (4) and (3)."""
+    value = _require_text(value)
+    result: list[dict[str, float]] = []
+    for line_number, raw_line in enumerate(value.strip().splitlines(), start=1):
+        if not raw_line.strip():
+            continue
+        fields = [item.strip() for item in raw_line.split("|")]
+        if len(fields) != 8:
+            raise ValueError(f"строка {line_number}: требуется 8 значений через символ |")
+        limits = (
+            (0.0, 1_000.0, "hi"),
+            (0.0, 1_000.0, "h1"),
+            (0.0, 100_000.0, "A1"),
+            (0.0, 1_000_000.0, "Ru"),
+            (0.0, 1_000_000.0, "A2"),
+            (0.0, 10_000.0, "Gn"),
+            (0.0, 10_000.0, "A3"),
+            (0.0, 1_000_000.0, "l"),
+        )
+        numbers = [
+            parse_number(field, minimum=minimum, maximum=maximum, label=label)
+            for field, (minimum, maximum, label) in zip(fields, limits, strict=True)
+        ]
+        hi, h1, a1, resistance, a2, permeability, a3, joints = numbers
+        if a1 > 0 and resistance <= 0:
+            raise ValueError(f"строка {line_number}: при A1 больше нуля Ru должно быть больше нуля")
+        if a2 > 0 and permeability <= 0:
+            raise ValueError(f"строка {line_number}: при A2 больше нуля Gn должно быть больше нуля")
+        if not any((a1, a2, a3, joints)):
+            raise ValueError(f"строка {line_number}: задайте хотя бы A1, A2, A3 или l")
+        result.append(
+            {
+                "opening_height_m": hi,
+                "first_floor_opening_height_m": h1,
+                "opening_area_m2": a1,
+                "air_permeability_resistance_m2_h_pa_kg": resistance,
+                "envelope_area_m2": a2,
+                "normative_air_permeability_kg_m2_h": permeability,
+                "gap_area_m2": a3,
+                "panel_joint_length_m": joints,
+            }
+        )
+    if not result:
+        raise ValueError("укажите хотя бы одну группу ограждений")
+    if len(result) > 50:
+        raise ValueError("допустимо не более 50 групп давления")
     return result
 
 
@@ -233,15 +392,21 @@ def parse_window_groups(value: str | None) -> list[dict[str, Any]]:
         if not 0.1 <= u_value <= 8:
             raise ValueError(f"строка {line_number}: U-value должен быть от 0,1 до 8")
         width, height = dimensions[0]
+        name = _bounded_label(fields[0], line_number, "название группы окон")
+        wall_name = (
+            _bounded_label(fields[4], line_number, "название стены")
+            if len(fields) == 5 and fields[4]
+            else None
+        )
         result.append(
             {
-                "name": fields[0][:60],
+                "name": name,
                 "count": count,
                 "width_m": width,
                 "height_m": height,
                 "area_m2": count * width * height,
                 "u_value": u_value,
-                "wall_name": fields[4][:60] if len(fields) == 5 and fields[4] else None,
+                "wall_name": wall_name,
             }
         )
     if not result:
@@ -276,15 +441,21 @@ def parse_door_groups(value: str | None) -> list[dict[str, Any]]:
         if not 0.1 <= u_value <= 8:
             raise ValueError(f"строка {line_number}: U-value должен быть от 0,1 до 8")
         width, height = dimensions[0]
+        name = _bounded_label(fields[0], line_number, "название группы дверей")
+        wall_name = (
+            _bounded_label(fields[4], line_number, "название стены")
+            if len(fields) == 5 and fields[4]
+            else None
+        )
         result.append(
             {
-                "name": fields[0][:60],
+                "name": name,
                 "count": count,
                 "width_m": width,
                 "height_m": height,
                 "area_m2": count * width * height,
                 "u_value": u_value,
-                "wall_name": fields[4][:60] if len(fields) == 5 and fields[4] else None,
+                "wall_name": wall_name,
             }
         )
     if not result:
@@ -297,4 +468,13 @@ def parse_door_groups(value: str | None) -> list[dict[str, Any]]:
 def _require_text(value: str | None) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError("Отправьте значение текстовым сообщением")
+    return value
+
+
+def _bounded_label(value: str, line_number: int, label: str) -> str:
+    value = value.strip()
+    if not 1 <= len(value) <= 60:
+        raise ValueError(f"строка {line_number}: {label} должно содержать от 1 до 60 символов")
+    if any(unicodedata.category(character).startswith("C") for character in value):
+        raise ValueError(f"строка {line_number}: {label} содержит управляющие символы")
     return value

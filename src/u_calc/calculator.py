@@ -1,11 +1,14 @@
+import math
 from dataclasses import replace
 
 from .catalog import MATERIALS, ClimateProfile
 from .models import (
+    Appendix8PressureInput,
     Boundary,
     Building,
     GroundFloorZone,
     HeatLossResult,
+    InfiltrationPath,
     LossLine,
     OpaqueSurface,
     Orientation,
@@ -49,6 +52,61 @@ ORIENTATION_HEAT_LOSS_FACTORS = {
 def orientation_heat_loss_factor(orientation: Orientation | None) -> float:
     """Return the normative orientation increment, or zero when it is unknown."""
     return ORIENTATION_HEAT_LOSS_FACTORS.get(orientation, 0.0)
+
+
+def appendix8_infiltration_mass_flow(paths: tuple[InfiltrationPath, ...]) -> float:
+    """Return infiltrating air mass flow in kg/h by Appendix 8 formula (3).
+
+    Each item represents surfaces at one calculated pressure difference. This
+    preserves the summation prescribed by the formula instead of averaging
+    pressure across openings at different elevations.
+    """
+    total = 0.0
+    for path in paths:
+        pressure_ratio = path.pressure_pa / path.first_floor_pressure_pa
+        opening_term = 0.0
+        if path.opening_area_m2:
+            opening_term = (
+                0.216
+                * path.opening_area_m2
+                * path.pressure_pa**0.67
+                / path.air_permeability_resistance_m2_h_pa_kg
+            )
+        total += (
+            opening_term
+            + path.envelope_area_m2
+            * path.normative_air_permeability_kg_m2_h
+            * pressure_ratio**0.67
+            + 3456 * path.gap_area_m2 * path.pressure_pa**0.5
+            + 0.5 * path.panel_joint_length_m * pressure_ratio
+        )
+    return total
+
+
+def appendix8_air_specific_weight_n_m3(temperature_c: float) -> float:
+    """Return air specific weight by Appendix 8 formula (5), N/m³."""
+    if not isinstance(temperature_c, (int, float)) or not math.isfinite(temperature_c):
+        raise ValueError("Температура воздуха должна быть конечным числом")
+    if temperature_c <= -273:
+        raise ValueError("Температура воздуха должна быть выше −273 °C")
+    return 3463.0 / (273.0 + temperature_c)
+
+
+def appendix8_pressure_difference_pa(inputs: Appendix8PressureInput) -> float:
+    """Return the signed pressure difference from Appendix 8 formula (4)."""
+    indoor_weight = appendix8_air_specific_weight_n_m3(inputs.indoor_temperature_c)
+    outdoor_weight = appendix8_air_specific_weight_n_m3(inputs.outdoor_temperature_c)
+    stack = (inputs.building_height_m - inputs.opening_height_m) * (
+        indoor_weight - outdoor_weight
+    )
+    wind = (
+        0.5
+        * inputs.outdoor_air_density_kg_m3
+        * inputs.wind_speed_m_s**2
+        * (inputs.windward_coefficient - inputs.leeward_coefficient)
+        * inputs.height_factor
+    )
+    return stack + wind - inputs.internal_pressure_pa
 
 
 def ground_floor_zones(
@@ -168,7 +226,8 @@ def _delta_t(indoor: float, outdoor: float, boundary: Boundary, adjacent: float 
 def calculate_heat_loss(building: Building) -> HeatLossResult:
     """Calculate steady-state design heat loss.
 
-    Q_transmission = U × A × ΔT. Ventilation uses 0.33 × ACH × volume × ΔT.
+    Q_transmission = U × A × ΔT. Air losses use separate mechanical, natural and
+    infiltration flows; heat recovery applies only to the mechanical component.
     Results are heating-system load estimates, not annual energy consumption.
     """
     lines: list[LossLine] = []
@@ -179,7 +238,17 @@ def calculate_heat_loss(building: Building) -> HeatLossResult:
             and not surface.layers
             and surface.adjacent_temperature_c is None
         ):
-            lines.append(LossLine(surface.name, "Ограждение", surface.area_m2, None, 0.0, 0.0))
+            lines.append(
+                LossLine(
+                    surface.name,
+                    "Ограждение",
+                    surface.area_m2,
+                    None,
+                    0.0,
+                    0.0,
+                    surface.kind,
+                )
+            )
             continue
         u = u_value(surface)
         dt = _delta_t(
@@ -196,7 +265,9 @@ def calculate_heat_loss(building: Building) -> HeatLossResult:
             * surface.position_factor
         )
         transmission += watts
-        lines.append(LossLine(surface.name, "Ограждение", surface.area_m2, u, dt, watts))
+        lines.append(
+            LossLine(surface.name, "Ограждение", surface.area_m2, u, dt, watts, surface.kind)
+        )
 
     for opening in building.openings:
         dt = _delta_t(
@@ -220,7 +291,17 @@ def calculate_heat_loss(building: Building) -> HeatLossResult:
         u = 1 / zone.resistance_m2k_w
         watts = u * zone.area_m2 * full_dt
         transmission += watts
-        lines.append(LossLine(zone.name, "Пол по грунту", zone.area_m2, u, full_dt, watts))
+        lines.append(
+            LossLine(
+                zone.name,
+                "Пол по грунту",
+                zone.area_m2,
+                u,
+                full_dt,
+                watts,
+                SurfaceKind.FLOOR,
+            )
+        )
 
     bridge_loss = transmission * building.thermal_bridge_factor
     if bridge_loss:
@@ -251,12 +332,13 @@ def calculate_heat_loss(building: Building) -> HeatLossResult:
         )
 
     if building.airflow is None:
-        # Backward compatibility for v0.2 payloads: the historical ACH represented
-        # one recoverable flow. New calculations always provide explicit components.
-        mechanical_flow = building.air_changes_per_hour * building.volume_m3
-        natural_flow = 0.0
+        # A legacy v0.2 ACH did not distinguish mechanical ventilation from
+        # infiltration. Recalculating it as recoverable would understate the load,
+        # so preserve the input but conservatively treat the combined flow as natural.
+        mechanical_flow = 0.0
+        natural_flow = building.air_changes_per_hour * building.volume_m3
         infiltration_flow = 0.0
-        recovery = building.heat_recovery_efficiency
+        recovery = 0.0
     else:
         mechanical_flow = building.airflow.mechanical_m3_h
         natural_flow = building.airflow.natural_m3_h
@@ -265,7 +347,26 @@ def calculate_heat_loss(building: Building) -> HeatLossResult:
 
     mechanical_loss = 0.33 * mechanical_flow * full_dt * (1 - recovery)
     natural_loss = 0.33 * natural_flow * full_dt
-    infiltration_loss = 0.33 * infiltration_flow * full_dt
+    if (
+        building.airflow is not None
+        and building.airflow.infiltration_basis == "appendix8_residential_exhaust"
+    ):
+        # SHNQ 2.04.05-22, appendix 8, formula (2):
+        # Q = 0.28 * L_n * rho * c * delta_t, c = 1 kJ/(kg*K).
+        room_air_density = 353 / (273 + building.indoor_temperature_c)
+        infiltration_loss = 0.28 * infiltration_flow * room_air_density * full_dt
+    elif (
+        building.airflow is not None
+        and building.airflow.infiltration_basis == "appendix8_envelope"
+    ):
+        # Appendix 8 requires the larger heat loss from formulas (1) and (2).
+        mass_flow = appendix8_infiltration_mass_flow(building.airflow.infiltration_paths)
+        formula_three_loss = 0.28 * mass_flow * full_dt
+        room_air_density = 353 / (273 + building.indoor_temperature_c)
+        formula_two_loss = 0.28 * infiltration_flow * room_air_density * full_dt
+        infiltration_loss = max(formula_three_loss, formula_two_loss)
+    else:
+        infiltration_loss = 0.33 * infiltration_flow * full_dt
     airflow_lines = (
         ("Механическая вентиляция", "Вентиляция", mechanical_flow, mechanical_loss),
         ("Естественная вентиляция", "Вентиляция", natural_flow, natural_loss),

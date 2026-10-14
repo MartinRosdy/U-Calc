@@ -63,7 +63,7 @@ class BotMappingTests(unittest.TestCase):
         self.assertEqual(len(building.opaque_surfaces), 2)  # wall and heated ceiling
         self.assertAlmostEqual(
             building.ground_floor_zones[0].resistance_m2k_w,
-            2.1 + 0.08 / 0.034,
+            2.1 + 0.08 / 0.032,
         )
         self.assertTrue(any("ШНҚ 2.04.05-22" in item for item in building.assumptions))
         self.assertFalse(any("50%" in item for item in building.assumptions))
@@ -78,11 +78,37 @@ class BotMappingTests(unittest.TestCase):
                 "custom_extreme": -34.0,
                 "custom_hot_mean": 25.0,
                 "custom_hot_max": 42.0,
+                "custom_climate_source": "Кыргызгидромет, 1991–2020",
             }
         )
         self.assertIsNotNone(profile)
         self.assertEqual(profile.name, "Бишкек")
         self.assertEqual(profile.outdoor_temperature("future"), -25)
+        self.assertEqual(len(profile.provenance), 5)
+        self.assertTrue(
+            all(item.status == "user_supplied_unverified" for item in profile.provenance)
+        )
+        self.assertTrue(all("Кыргызгидромет" in item.document for item in profile.provenance))
+
+    def test_user_confirmed_design_temperature_is_not_mislabelled_as_normative(self) -> None:
+        profile = _climate_from_answers(
+            {
+                "climate_key": "tashkent",
+                "confirmed_design_c": -14.0,
+                "confirmed_design_source": "Проект ОВ, лист 3",
+            }
+        )
+        design_source = profile.provenance[-1]
+        self.assertEqual(
+            sum(item.parameter == "design_c" for item in profile.provenance),
+            1,
+        )
+        self.assertEqual(design_source.parameter, "design_c")
+        self.assertEqual(design_source.document, "Проект ОВ, лист 3")
+        self.assertEqual(design_source.status, "user_supplied_unverified")
+        self.assertIn("определение параметра Б", design_source.location)
+        self.assertIn("ШНҚ 2.01.18-24, п. 16", design_source.location)
+        self.assertIn("пятидневка 0,92", profile.source_note)
 
     def test_answers_create_net_wall_area_and_heated_neighbors(self) -> None:
         building = _build_from_answers(
@@ -222,6 +248,112 @@ class BotMappingTests(unittest.TestCase):
             ["wood", "mineral_wool"],
         )
         self.assertEqual(building.openings[0].name, "Окна (4 шт.)")
+
+    def test_advanced_floor_and_roof_keep_every_explicit_layer(self) -> None:
+        building = _build_from_answers(
+            {
+                "wall_material": "brick_solid",
+                "wall_thickness": 0.25,
+                "wall_gross_area": 50,
+                "window_area": 0,
+                "door_area": 0,
+                "length": 8,
+                "width": 6,
+                "floor_boundary": "unheated",
+                "floor_layers": [
+                    {"material": "concrete", "thickness_m": 0.18},
+                    {"material": "xps", "thickness_m": 0.08},
+                    {"material": "wood", "thickness_m": 0.02},
+                ],
+                "ceiling_boundary": "outdoor",
+                "ceiling_layers": [
+                    {"material": "wood", "thickness_m": 0.04},
+                    {
+                        "material": "custom",
+                        "material_conductivity": 0.033,
+                        "thickness_m": 0.2,
+                    },
+                ],
+                "indoor": 24,
+                "outdoor": -14,
+                "volume": 144,
+                "air_changes": 0.5,
+            }
+        )
+        floor, roof = building.opaque_surfaces[1:]
+        self.assertEqual(
+            [layer.material_key for layer in floor.layers],
+            ["concrete", "xps", "wood"],
+        )
+        self.assertEqual([layer.material_key for layer in roof.layers], ["wood", "custom"])
+        self.assertAlmostEqual(roof.layers[1].conductivity_w_mk, 0.033)
+
+    def test_appendix8_infiltration_basis_reaches_model_and_assumptions(self) -> None:
+        building = _build_from_answers(
+            {
+                "wall_material": "brick_solid",
+                "wall_thickness": 0.25,
+                "wall_gross_area": 50,
+                "window_area": 0,
+                "door_area": 0,
+                "length": 8,
+                "width": 6,
+                "floor_boundary": "heated",
+                "ceiling_boundary": "heated",
+                "indoor": 24,
+                "outdoor": -14,
+                "volume": 144,
+                "airflow_input_basis": "components_m3h",
+                "mechanical_ventilation_m3_h": 0,
+                "natural_ventilation_m3_h": 0,
+                "infiltration_m3_h": 90,
+                "infiltration_basis": "appendix8_residential_exhaust",
+            }
+        )
+        self.assertEqual(
+            building.airflow.infiltration_basis,
+            "appendix8_residential_exhaust",
+        )
+        self.assertEqual(building.airflow.input_basis, "components_m3_h")
+        self.assertTrue(any("формуле 2 приложения 8" in item for item in building.assumptions))
+
+    def test_appendix8_envelope_paths_reach_domain_model(self) -> None:
+        building = _build_from_answers(
+            {
+                "wall_material": "brick_solid",
+                "wall_thickness": 0.25,
+                "wall_gross_area": 50,
+                "window_area": 0,
+                "door_area": 0,
+                "length": 8,
+                "width": 6,
+                "floor_boundary": "heated",
+                "ceiling_boundary": "heated",
+                "indoor": 24,
+                "outdoor": -14,
+                "volume": 144,
+                "airflow_input_basis": "components_m3_h",
+                "mechanical_ventilation_m3_h": 0,
+                "natural_ventilation_m3_h": 0,
+                "infiltration_m3_h": 0,
+                "infiltration_basis": "appendix8_envelope",
+                "infiltration_paths": [
+                    {
+                        "pressure_pa": 12,
+                        "first_floor_pressure_pa": 10,
+                        "opening_area_m2": 20,
+                        "air_permeability_resistance_m2_h_pa_kg": 0.5,
+                        "envelope_area_m2": 0,
+                        "normative_air_permeability_kg_m2_h": 0,
+                        "gap_area_m2": 0,
+                        "panel_joint_length_m": 0,
+                    }
+                ],
+            }
+        )
+        self.assertEqual(building.airflow.infiltration_basis, "appendix8_envelope")
+        self.assertEqual(building.airflow.infiltration_paths[0].pressure_pa, 12)
+        self.assertTrue(any("формуле 3 приложения 8" in item for item in building.assumptions))
 
     def test_different_wall_groups_keep_individual_constructions(self) -> None:
         data = {

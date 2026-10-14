@@ -11,6 +11,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from ..i18n import translate as tr
 from ..storage import CalculationProfile, CalculationRepository
+from .common import product_identity
 
 router = Router(name=__name__)
 
@@ -33,6 +34,7 @@ def main_menu(locale: str) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text=tr("menu.profiles", locale), callback_data="m:profiles")],
             [InlineKeyboardButton(text=tr("menu.language", locale), callback_data="m:language")],
             [InlineKeyboardButton(text=tr("menu.help", locale), callback_data="m:help")],
+            [InlineKeyboardButton(text=tr("menu.privacy", locale), callback_data="m:privacy")],
         ]
     )
 
@@ -111,13 +113,79 @@ async def language_save(callback: CallbackQuery, repository: CalculationReposito
 async def help_menu(callback: CallbackQuery, repository: CalculationRepository) -> None:
     locale = await _locale(repository, callback.from_user.id)
     await callback.message.answer(
-        tr("help.text", locale),
+        f"{tr('help.text', locale)}\n\n{product_identity(locale)}",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text=tr("menu.home", locale), callback_data="m:home")]
             ]
         ),
     )
+    await callback.answer()
+
+
+async def _send_privacy_prompt(message: Message, locale: str) -> None:
+    await message.answer(
+        tr("privacy.delete_prompt", locale),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=tr("privacy.delete_confirm", locale),
+                        callback_data="privacy:delete_confirm",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text=tr("common.cancel", locale),
+                        callback_data="privacy:cancel",
+                    )
+                ],
+            ]
+        ),
+    )
+
+
+@router.callback_query(F.data == "m:privacy")
+async def privacy_menu(callback: CallbackQuery, repository: CalculationRepository) -> None:
+    locale = await _locale(repository, callback.from_user.id)
+    await _send_privacy_prompt(callback.message, locale)
+    await callback.answer()
+
+
+@router.message(Command("delete_my_data"))
+async def delete_my_data_command(message: Message, repository: CalculationRepository) -> None:
+    await _send_privacy_prompt(message, await _locale(repository, message.from_user.id))
+
+
+@router.callback_query(F.data.startswith("privacy:"))
+async def privacy_action(
+    callback: CallbackQuery,
+    state: FSMContext,
+    repository: CalculationRepository,
+) -> None:
+    locale = await _locale(repository, callback.from_user.id)
+    action = callback.data.split(":", 1)[1]
+    if action == "cancel":
+        await callback.message.answer(
+            tr("privacy.delete_cancelled", locale), reply_markup=main_menu(locale)
+        )
+    elif action == "delete_confirm":
+        deleted = await asyncio.to_thread(
+            repository.delete_all_user_data, callback.from_user.id
+        )
+        await state.clear()
+        await callback.message.answer(
+            tr(
+                "privacy.deleted",
+                locale,
+                calculations=deleted.calculations,
+                profiles=deleted.profiles,
+                drafts=deleted.drafts,
+            )
+        )
+    else:
+        await callback.answer(tr("common.invalid_option", locale), show_alert=True)
+        return
     await callback.answer()
 
 
@@ -131,11 +199,21 @@ async def history_menu(callback: CallbackQuery, repository: CalculationRepositor
             f"• №{item.id} · {item.object_name} · {item.recommended_kw:.2f} kW" for item in records
         )
     else:
-        lines = ["История пока пуста." if locale == "ru" else "Hisoblar tarixi bo‘sh."]
+        lines = [tr("history.empty", locale)]
+    history_rows = [
+        [
+            InlineKeyboardButton(
+                text=tr("history.open", locale, id=item.id, name=item.object_name[:32]),
+                callback_data=f"h:view:{item.id}",
+            )
+        ]
+        for item in records
+    ]
     await callback.message.answer(
         "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
+            inline_keyboard=history_rows
+            + [
                 [InlineKeyboardButton(text=tr("menu.new", locale), callback_data="m:new")],
                 [InlineKeyboardButton(text=tr("menu.home", locale), callback_data="m:home")],
             ]

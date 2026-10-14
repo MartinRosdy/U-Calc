@@ -3,6 +3,8 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from u_calc.config import Settings
+from u_calc.handlers import history as history_handlers
 from u_calc.handlers import menu
 from u_calc.storage import CalculationRepository
 
@@ -21,6 +23,9 @@ class FakeState:
     async def set_state(self, state) -> None:
         self.state = state
 
+    async def set_data(self, data: dict) -> None:
+        self.data = dict(data)
+
     async def update_data(self, **values) -> None:
         self.data.update(values)
 
@@ -33,9 +38,13 @@ class FakeMessage:
         self.text = text
         self.from_user = SimpleNamespace(id=user_id)
         self.answers = []
+        self.documents = []
 
     async def answer(self, text, **kwargs) -> None:
         self.answers.append((text, kwargs))
+
+    async def answer_document(self, document, **kwargs) -> None:
+        self.documents.append((document, kwargs))
 
 
 class FakeCallback:
@@ -64,7 +73,7 @@ class MenuFlowTests(unittest.IsolatedAsyncioTestCase):
         await menu.start_menu(self.message, self.state, self.repository)
         self.assertEqual(self.state.clear_count, 1)
         self.assertIn("U-Calc", self.message.answers[-1][0])
-        self.assertEqual(len(menu.main_menu("ru").inline_keyboard), 5)
+        self.assertEqual(len(menu.main_menu("ru").inline_keyboard), 6)
 
         callback = FakeCallback("m:language", self.message)
         await menu.language_menu(callback, self.repository)
@@ -78,6 +87,8 @@ class MenuFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("saqlandi", self.message.answers[-1][0])
 
         await menu.help_menu(FakeCallback("m:help", self.message), self.repository)
+        self.assertIn("1.0.0", self.message.answers[-1][0])
+        self.assertIn("Me’yoriy baza", self.message.answers[-1][0])
         await menu.history_menu(FakeCallback("m:history", self.message), self.repository)
         self.assertIn("bo‘sh", self.message.answers[-1][0])
 
@@ -91,6 +102,143 @@ class MenuFlowTests(unittest.IsolatedAsyncioTestCase):
         await menu.history_menu(FakeCallback("m:history", self.message), self.repository)
         self.assertIn("Uy", self.message.answers[-1][0])
         await menu.home_callback(FakeCallback("m:home", self.message), self.state, self.repository)
+
+    async def test_privacy_flow_cancels_or_erases_all_user_data(self) -> None:
+        calculation_id = self.repository.save(
+            100, {"object_name": "Дом"}, 5, 5.5, "report"
+        )
+        self.repository.store_pdf_for_user(100, calculation_id, b"%PDF-1.4\nprivate")
+        self.repository.save_draft(100, "Survey:wall_material", {"secret": "draft"})
+        self.repository.create_profile(100, "Рабочий", make_default=True)
+
+        await menu.privacy_menu(FakeCallback("m:privacy", self.message), self.repository)
+        prompt_markup = self.message.answers[-1][1]["reply_markup"]
+        self.assertEqual(
+            prompt_markup.inline_keyboard[0][0].callback_data,
+            "privacy:delete_confirm",
+        )
+        await menu.privacy_action(
+            FakeCallback("privacy:cancel", self.message), self.state, self.repository
+        )
+        self.assertIsNotNone(self.repository.get_for_user(100, calculation_id))
+
+        await menu.privacy_action(
+            FakeCallback("privacy:delete_confirm", self.message),
+            self.state,
+            self.repository,
+        )
+        self.assertEqual(self.state.clear_count, 1)
+        self.assertIsNone(self.repository.get_for_user(100, calculation_id))
+        self.assertIsNone(self.repository.load_draft(100))
+        self.assertEqual(self.repository.list_profiles(100), [])
+        self.assertEqual(self.repository.recent_audit_events(100), [])
+        self.assertIn("Все ваши данные удалены", self.message.answers[-1][0])
+
+        stale = FakeCallback("privacy:stale", self.message)
+        await menu.privacy_action(stale, self.state, self.repository)
+        self.assertTrue(stale.answers[-1][1]["show_alert"])
+
+    async def test_button_history_card_compare_copy_and_private_delete(self) -> None:
+        first = self.repository.save(
+            100,
+            {
+                "object_name": "Uy",
+                "building_type": "house",
+                "indoor": 20,
+                "locale": "uz",
+                "calculation_request_id": "first-private-id",
+                "wall_groups": [],
+            },
+            4,
+            4.4,
+            "birinchi hisobot",
+        )
+        second = self.repository.save(
+            100,
+            {
+                "object_name": "Uy",
+                "building_type": "house",
+                "indoor": 22,
+                "locale": "uz",
+                "prepared_by": "Usta Ali",
+                "calculation_request_id": "second-private-id",
+                "wall_groups": [{"material": "brick_solid", "area": 80}],
+            },
+            5,
+            5.5,
+            "ikkinchi hisobot",
+            parent_id=first,
+        )
+        self.repository.set_locale(100, "uz")
+        command_message = FakeMessage(user_id=100)
+        await history_handlers.help_command(command_message, self.repository)
+        self.assertIn("Buyruqlar:", command_message.answers[-1][0])
+        self.assertIn("Mahsulot versiyasi: 1.0.0", command_message.answers[-1][0])
+        self.assertIn("Me’yoriy baza:", command_message.answers[-1][0])
+        settings = Settings(bot_token="secret", database_path=self.repository.path)
+        await history_handlers.history(command_message, self.repository, settings)
+        self.assertIn("So‘nggi hisoblar", command_message.answers[-1][0])
+
+        await menu.history_menu(FakeCallback("m:history", self.message), self.repository)
+        history_markup = self.message.answers[-1][1]["reply_markup"]
+        self.assertEqual(history_markup.inline_keyboard[0][0].callback_data, f"h:view:{second}")
+
+        await history_handlers.calculation_card(
+            FakeCallback(f"h:view:{second}", self.message), self.repository, settings
+        )
+        card_text, card_kwargs = self.message.answers[-1]
+        self.assertIn("Hisob", card_text)
+        self.assertIn("Versiya muallifi: Usta Ali", card_text)
+        callbacks = [row[0].callback_data for row in card_kwargs["reply_markup"].inline_keyboard]
+        self.assertIn(f"h:compare:{second}", callbacks)
+        self.assertIn(f"h:pdf:{second}", callbacks)
+
+        missing_pdf = FakeCallback(f"h:pdf:{second}", self.message)
+        await history_handlers.calculation_pdf_callback(missing_pdf, self.repository)
+        self.assertTrue(missing_pdf.answers[-1][1]["show_alert"])
+
+        self.repository.store_pdf_for_user(100, second, b"%PDF-1.4\nstored")
+        downloaded = FakeCallback(f"h:pdf:{second}", self.message)
+        await history_handlers.calculation_pdf_callback(downloaded, self.repository)
+        self.assertEqual(len(self.message.documents), 1)
+        self.assertIn("2-versiya", self.message.documents[0][1]["caption"])
+
+        foreign_pdf = FakeMessage(user_id=200)
+        denied_pdf = FakeCallback(f"h:pdf:{second}", foreign_pdf)
+        await history_handlers.calculation_pdf_callback(denied_pdf, self.repository)
+        self.assertTrue(denied_pdf.answers[-1][1]["show_alert"])
+
+        compared = FakeCallback(f"h:compare:{second}", self.message)
+        await history_handlers.calculation_compare_callback(compared, self.repository)
+        comparison_text = self.message.answers[-1][0]
+        self.assertIn("Ichki harorat, °C: 20 → 22", comparison_text)
+        self.assertIn(
+            "Devor konstruksiyalari: o‘zgargan blok (0 element) → "
+            "o‘zgargan blok (1 element)",
+            comparison_text,
+        )
+        self.assertNotIn("indoor", comparison_text)
+        self.assertNotIn("calculation_request_id", comparison_text)
+        self.assertNotIn("private-id", comparison_text)
+
+        reported = FakeCallback(f"h:report:{second}", self.message)
+        await history_handlers.calculation_report_callback(reported, self.repository)
+        self.assertIn("ikkinchi hisobot", self.message.answers[-1][0])
+
+        copied = FakeCallback(f"h:copy:{second}", self.message)
+        await history_handlers.calculation_copy_callback(copied, self.state, self.repository)
+        self.assertEqual(self.state.data["parent_calculation_id"], second)
+        self.assertIn("nusxalandi", self.message.answers[-2][0])
+
+        foreign = FakeMessage(user_id=200)
+        denied = FakeCallback(f"h:delete:{second}", foreign)
+        await history_handlers.calculation_delete_prompt(denied, self.repository)
+        self.assertTrue(denied.answers[-1][1]["show_alert"])
+        self.assertIsNotNone(self.repository.get_for_user(100, second))
+
+        deleted = FakeCallback(f"h:delete_confirm:{second}", self.message)
+        await history_handlers.calculation_delete_confirm(deleted, self.repository)
+        self.assertIsNone(self.repository.get_for_user(100, second))
 
     async def test_new_calculation_and_profiles_command(self) -> None:
         callback = FakeCallback("m:new", self.message)

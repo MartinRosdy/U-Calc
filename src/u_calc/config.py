@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 VALID_LOG_LEVELS = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}
+TELEGRAM_TOKEN_PATTERN = re.compile(r"^[1-9][0-9]{4,15}:[A-Za-z0-9_-]{20,}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,6 +19,7 @@ class Settings:
     app_timezone: str = "Asia/Tashkent"
     allowed_user_ids: frozenset[int] = frozenset()
     rate_limit_per_minute: int = 30
+    global_rate_limit_per_minute: int = 600
     calculation_rate_limit_per_minute: int = 6
     max_message_length: int = 4096
     history_retention_days: int = 730
@@ -27,8 +30,19 @@ class Settings:
         token = os.getenv("BOT_TOKEN", "").strip()
         if not token:
             raise RuntimeError("Не задан BOT_TOKEN. Передайте токен через переменную окружения.")
+        if (
+            "replace-with-token" in token.casefold()
+            or TELEGRAM_TOKEN_PATTERN.fullmatch(token) is None
+        ):
+            raise RuntimeError(
+                "BOT_TOKEN имеет неверный формат или остался шаблонным значением. "
+                "Скопируйте актуальный токен из BotFather."
+            )
 
-        database_path = Path(os.getenv("DATABASE_PATH", "data/u_calc.db").strip())
+        database_path_raw = os.getenv("DATABASE_PATH", "data/u_calc.db").strip()
+        if not database_path_raw:
+            raise RuntimeError("DATABASE_PATH не может быть пустым")
+        database_path = Path(database_path_raw)
         log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper()
         if log_level not in VALID_LOG_LEVELS:
             allowed = ", ".join(sorted(VALID_LOG_LEVELS))
@@ -42,6 +56,7 @@ class Settings:
 
         allowed_user_ids = _parse_user_ids(os.getenv("ALLOWED_USER_IDS", ""))
         rate_limit = _bounded_int("RATE_LIMIT_PER_MINUTE", 30, 5, 300)
+        global_rate_limit = _bounded_int("GLOBAL_RATE_LIMIT_PER_MINUTE", 600, 30, 10_000)
         calculation_rate_limit = _bounded_int("CALCULATION_RATE_LIMIT_PER_MINUTE", 6, 1, 60)
         max_message_length = _bounded_int("MAX_MESSAGE_LENGTH", 4096, 100, 4096)
         history_retention_days = _bounded_int("HISTORY_RETENTION_DAYS", 730, 1, 3650)
@@ -53,6 +68,7 @@ class Settings:
             app_timezone=timezone_name,
             allowed_user_ids=allowed_user_ids,
             rate_limit_per_minute=rate_limit,
+            global_rate_limit_per_minute=global_rate_limit,
             calculation_rate_limit_per_minute=calculation_rate_limit,
             max_message_length=max_message_length,
             history_retention_days=history_retention_days,

@@ -4,6 +4,9 @@ from itertools import combinations
 from math import isfinite
 
 from u_calc.calculator import (
+    appendix8_air_specific_weight_n_m3,
+    appendix8_infiltration_mass_flow,
+    appendix8_pressure_difference_pa,
     calculate_climate_scenarios,
     calculate_heat_loss,
     ground_floor_zones,
@@ -12,8 +15,10 @@ from u_calc.calculator import (
 from u_calc.catalog import CLIMATES
 from u_calc.models import (
     Airflow,
+    Appendix8PressureInput,
     Boundary,
     Building,
+    InfiltrationPath,
     Layer,
     LinearThermalBridge,
     OpaqueSurface,
@@ -24,6 +29,86 @@ from u_calc.models import (
 
 
 class CalculatorTests(unittest.TestCase):
+    def test_appendix8_formula_four_and_five_match_official_expression(self) -> None:
+        inputs = Appendix8PressureInput(
+            building_height_m=12,
+            opening_height_m=8,
+            indoor_temperature_c=24,
+            outdoor_temperature_c=-15,
+            outdoor_air_density_kg_m3=1.3,
+            wind_speed_m_s=5,
+            windward_coefficient=0.8,
+            leeward_coefficient=-0.6,
+            height_factor=1,
+            internal_pressure_pa=2,
+        )
+        expected = (
+            (12 - 8) * (3463 / (273 + 24) - 3463 / (273 - 15))
+            + 0.5 * 1.3 * 5**2 * (0.8 - (-0.6))
+            - 2
+        )
+        self.assertAlmostEqual(appendix8_pressure_difference_pa(inputs), expected)
+        self.assertAlmostEqual(appendix8_air_specific_weight_n_m3(-15), 3463 / 258)
+
+    def test_appendix8_formula_three_matches_official_expression(self) -> None:
+        path = InfiltrationPath(
+            pressure_pa=12,
+            first_floor_pressure_pa=10,
+            opening_area_m2=20,
+            air_permeability_resistance_m2_h_pa_kg=0.5,
+            envelope_area_m2=100,
+            normative_air_permeability_kg_m2_h=0.2,
+            gap_area_m2=0.01,
+            panel_joint_length_m=25,
+        )
+        expected = (
+            0.216 * 20 * 12**0.67 / 0.5
+            + 100 * 0.2 * (12 / 10) ** 0.67
+            + 3456 * 0.01 * 12**0.5
+            + 0.5 * 25 * (12 / 10)
+        )
+        self.assertAlmostEqual(appendix8_infiltration_mass_flow((path,)), expected)
+
+    def test_appendix8_envelope_uses_larger_of_formula_one_and_two(self) -> None:
+        path = InfiltrationPath(
+            pressure_pa=10,
+            first_floor_pressure_pa=10,
+            envelope_area_m2=1,
+            normative_air_permeability_kg_m2_h=1,
+        )
+        building = Building(
+            indoor_temperature_c=24,
+            outdoor_temperature_c=-6,
+            volume_m3=200,
+            opaque_surfaces=(),
+            airflow=Airflow(
+                infiltration_m3_h=90,
+                infiltration_basis="appendix8_envelope",
+                infiltration_paths=(path,),
+            ),
+            safety_factor=1,
+        )
+        result = calculate_heat_loss(building)
+        density = 353 / (273 + 24)
+        self.assertAlmostEqual(result.ventilation_w, 0.28 * 90 * density * 30)
+
+        formula_three_building = replace(
+            building,
+            airflow=Airflow(
+                infiltration_m3_h=0,
+                infiltration_basis="appendix8_envelope",
+                infiltration_paths=(
+                    InfiltrationPath(
+                        pressure_pa=10,
+                        first_floor_pressure_pa=10,
+                        gap_area_m2=0.1,
+                    ),
+                ),
+            ),
+        )
+        formula_three = calculate_heat_loss(formula_three_building)
+        self.assertAlmostEqual(formula_three.ventilation_w, 0.28 * 3456 * 0.1 * 10**0.5 * 30)
+
     def test_recovery_never_reduces_infiltration(self) -> None:
         common = dict(
             indoor_temperature_c=20,
@@ -73,6 +158,25 @@ class CalculatorTests(unittest.TestCase):
         result = calculate_heat_loss(building)
         self.assertAlmostEqual(result.ventilation_w, 0.33 * (100 + 20 + 40) * 30)
 
+    def test_legacy_combined_ach_never_receives_heat_recovery(self) -> None:
+        building = Building(
+            indoor_temperature_c=20,
+            outdoor_temperature_c=-10,
+            volume_m3=100,
+            opaque_surfaces=(),
+            air_changes_per_hour=0.5,
+            heat_recovery_efficiency=0.8,
+            safety_factor=1,
+        )
+
+        result = calculate_heat_loss(building)
+
+        self.assertAlmostEqual(result.ventilation_w, 0.33 * 0.5 * 100 * 30)
+        mechanical = next(line for line in result.lines if line.name == "Механическая вентиляция")
+        natural = next(line for line in result.lines if line.name == "Естественная вентиляция")
+        self.assertEqual(mechanical.watts, 0)
+        self.assertAlmostEqual(natural.watts, result.ventilation_w)
+
     def test_eighty_percent_recovery_reduces_only_mechanical_flow(self) -> None:
         building = Building(
             indoor_temperature_c=20,
@@ -104,6 +208,29 @@ class CalculatorTests(unittest.TestCase):
         mechanical = next(line for line in result.lines if line.name == "Механическая вентиляция")
         self.assertEqual(mechanical.watts, 0)
         self.assertAlmostEqual(result.ventilation_w, 0.33 * 30 * 30)
+
+    def test_appendix8_residential_infiltration_uses_formula_two(self) -> None:
+        building = Building(
+            indoor_temperature_c=24,
+            outdoor_temperature_c=-6,
+            volume_m3=200,
+            opaque_surfaces=(),
+            airflow=Airflow(
+                infiltration_m3_h=90,
+                infiltration_basis="appendix8_residential_exhaust",
+            ),
+            safety_factor=1,
+        )
+        result = calculate_heat_loss(building)
+        density = 353 / (273 + 24)
+        expected = 0.28 * 90 * density * 30
+        infiltration = next(line for line in result.lines if line.kind == "Инфильтрация")
+        self.assertAlmostEqual(infiltration.watts, expected)
+        self.assertAlmostEqual(result.ventilation_w, expected)
+
+    def test_unknown_infiltration_basis_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "способ задания инфильтрации"):
+            Airflow(infiltration_basis="n50-magic")
 
     def test_ground_floor_zones_count_exterior_corners_twice(self) -> None:
         zones = ground_floor_zones(30, 20)
@@ -234,7 +361,8 @@ class CalculatorTests(unittest.TestCase):
             "Стена", 10, (Layer("brick_solid", 0.25), Layer("mineral_wool", 0.05))
         )
         self.assertLess(u_value(insulated), u_value(bare))
-        self.assertAlmostEqual(u_value(insulated), 0.579, delta=0.006)
+        # R = Rsi + 0.25 / 0.81 + 0.05 / 0.05 + Rse for catalog λБ values.
+        self.assertAlmostEqual(u_value(insulated), 0.6762962344)
 
     def test_custom_passport_conductivity_overrides_catalog(self) -> None:
         custom = OpaqueSurface("Стена", 10, (Layer("custom", 0.30, 0.10),))

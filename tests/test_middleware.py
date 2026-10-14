@@ -1,10 +1,12 @@
 import asyncio
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -13,8 +15,10 @@ from aiogram.types import CallbackQuery
 from u_calc.config import Settings
 from u_calc.middleware import (
     AccessMiddleware,
+    CallbackKeyboardCleanupMiddleware,
     DraftPersistenceMiddleware,
     NavigationMiddleware,
+    PrivateChatMiddleware,
     PublicSafetyMiddleware,
     UserMutationLockMiddleware,
     _is_navigation_event,
@@ -61,6 +65,89 @@ class PublicSafetyMiddlewareTests(unittest.IsolatedAsyncioTestCase):
         await middleware(handler, FakeEvent("ok", user_id=20), {})
         self.assertEqual(calls, 6)
         self.assertIn("Слишком много", event.answers[0][0])
+
+    async def test_global_rate_limit_bounds_many_distinct_users(self) -> None:
+        middleware = PublicSafetyMiddleware(
+            Settings(
+                bot_token="secret",
+                rate_limit_per_minute=30,
+                global_rate_limit_per_minute=2,
+            )
+        )
+        handler = AsyncMock(return_value="ok")
+
+        first = FakeEvent("ok", user_id=10)
+        second = FakeEvent("ok", user_id=20)
+        blocked = FakeEvent("ok", user_id=30)
+        self.assertEqual(await middleware(handler, first, {}), "ok")
+        self.assertEqual(await middleware(handler, second, {}), "ok")
+        self.assertIsNone(await middleware(handler, blocked, {}))
+
+        self.assertEqual(handler.await_count, 2)
+        self.assertEqual(len(middleware.global_events), 2)
+        self.assertEqual(set(middleware.events), {10, 20})
+        self.assertIn("временно занят", blocked.answers[-1][0])
+
+    async def test_global_limit_does_not_allocate_buckets_or_rows_for_blocked_users(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "rate-limit.db"
+            repository = CalculationRepository(database)
+            repository.initialize()
+            middleware = PublicSafetyMiddleware(
+                Settings(
+                    bot_token="secret",
+                    rate_limit_per_minute=30,
+                    global_rate_limit_per_minute=2,
+                ),
+                repository,
+            )
+            handler = AsyncMock(return_value="ok")
+
+            for user_id in range(100, 200):
+                await middleware(handler, FakeEvent("ok", user_id=user_id), {})
+
+            self.assertEqual(handler.await_count, 2)
+            self.assertEqual(len(middleware.global_events), 2)
+            self.assertEqual(set(middleware.events), {100, 101})
+            with sqlite3.connect(database) as connection:
+                saved_users = connection.execute(
+                    "SELECT COUNT(*) FROM user_settings"
+                ).fetchone()[0]
+            self.assertEqual(saved_users, 0)
+
+    async def test_rejected_attempts_consume_global_budget_and_overload_replies_are_bounded(
+        self,
+    ) -> None:
+        middleware = PublicSafetyMiddleware(
+            Settings(
+                bot_token="secret",
+                rate_limit_per_minute=1,
+                global_rate_limit_per_minute=3,
+            )
+        )
+        handler = AsyncMock(return_value="ok")
+        accepted = FakeEvent("ok", user_id=10)
+        per_user_blocked = FakeEvent("ok", user_id=10)
+        fills_budget = FakeEvent("ok", user_id=20)
+        overload_notice = FakeEvent("ok", user_id=30)
+        silently_dropped = FakeEvent("ok", user_id=40)
+
+        with patch("u_calc.middleware.time.monotonic", return_value=100.0):
+            await middleware(handler, accepted, {})
+            await middleware(handler, per_user_blocked, {})
+            await middleware(handler, fills_budget, {})
+            await middleware(handler, overload_notice, {})
+            await middleware(handler, silently_dropped, {})
+
+        self.assertEqual(handler.await_count, 2)
+        self.assertEqual(len(middleware.global_events), 3)
+        self.assertIn("Слишком много", per_user_blocked.answers[-1][0])
+        self.assertIn("временно занят", overload_notice.answers[-1][0])
+        self.assertEqual(silently_dropped.answers, [])
+        self.assertNotIn(30, middleware.events)
+        self.assertNotIn(40, middleware.events)
 
     async def test_inactive_user_buckets_are_removed(self) -> None:
         middleware = PublicSafetyMiddleware(Settings(bot_token="secret"))
@@ -162,6 +249,44 @@ class AccessAndStateMiddlewareTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await middleware(handler, FakeEvent("x", user_id=10), {}), "allowed")
         self.assertEqual(calls, 1)
 
+    async def test_private_chat_gate_blocks_groups_for_messages_and_callbacks(self) -> None:
+        middleware = PrivateChatMiddleware()
+        handler = AsyncMock(return_value="allowed")
+
+        group_message = FakeEvent("/start", user_id=10)
+        group_message.chat = SimpleNamespace(type="group")
+        self.assertIsNone(await middleware(handler, group_message, {}))
+        self.assertIn("только в личном чате", group_message.answers[-1][0])
+
+        callback = Mock(spec=CallbackQuery)
+        callback.from_user = SimpleNamespace(id=10)
+        callback.message = SimpleNamespace(chat=SimpleNamespace(type="supergroup"))
+        callback.answer = AsyncMock()
+        self.assertIsNone(await middleware(handler, callback, {}))
+        callback.answer.assert_awaited_once_with(
+            "U-Calc работает только в личном чате. Откройте диалог с ботом, чтобы данные "
+            "объекта и PDF не попали в общий чат.",
+            show_alert=True,
+        )
+
+        private_message = FakeEvent("/start", user_id=10)
+        private_message.chat = SimpleNamespace(type="private")
+        self.assertEqual(await middleware(handler, private_message, {}), "allowed")
+        handler.assert_awaited_once()
+
+    async def test_private_chat_gate_uses_saved_uzbek_locale(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = CalculationRepository(Path(directory) / "locale.db")
+            repository.initialize()
+            repository.set_locale(10, "uz")
+            middleware = PrivateChatMiddleware(repository)
+            group_message = FakeEvent("/start", user_id=10)
+            group_message.chat = SimpleNamespace(type="group")
+
+            await middleware(AsyncMock(), group_message, {})
+
+            self.assertIn("faqat shaxsiy chatda", group_message.answers[-1][0])
+
     async def test_access_and_public_limits_use_saved_uzbek_locale(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repository = CalculationRepository(Path(directory) / "locale.db")
@@ -249,6 +374,56 @@ class AccessAndStateMiddlewareTests(unittest.IsolatedAsyncioTestCase):
 
             await middleware(profile_flow, event, {"state": self.state})
             self.assertIsNone(repository.load_draft(10))
+
+
+class CallbackKeyboardCleanupMiddlewareTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _callback(*, has_markup: bool = True) -> Mock:
+        callback = Mock(spec=CallbackQuery)
+        callback.message = SimpleNamespace(
+            reply_markup=object() if has_markup else None,
+            edit_reply_markup=AsyncMock(),
+        )
+        return callback
+
+    async def test_successful_callback_closes_the_used_keyboard(self) -> None:
+        middleware = CallbackKeyboardCleanupMiddleware()
+        callback = self._callback()
+
+        async def handler(_event, _data):
+            return "done"
+
+        result = await middleware(handler, callback, {})
+
+        self.assertEqual(result, "done")
+        callback.message.edit_reply_markup.assert_awaited_once_with(reply_markup=None)
+
+    async def test_failed_action_keeps_keyboard_available_for_retry(self) -> None:
+        middleware = CallbackKeyboardCleanupMiddleware()
+        callback = self._callback()
+
+        async def handler(_event, _data):
+            raise RuntimeError("failed")
+
+        with self.assertRaisesRegex(RuntimeError, "failed"):
+            await middleware(handler, callback, {})
+        callback.message.edit_reply_markup.assert_not_awaited()
+
+    async def test_missing_keyboard_is_not_edited_and_telegram_rejection_is_nonfatal(self) -> None:
+        middleware = CallbackKeyboardCleanupMiddleware()
+
+        async def handler(_event, _data):
+            return "done"
+
+        without_markup = self._callback(has_markup=False)
+        await middleware(handler, without_markup, {})
+        without_markup.message.edit_reply_markup.assert_not_awaited()
+
+        rejected = self._callback()
+        rejected.message.edit_reply_markup.side_effect = TelegramBadRequest(
+            method=Mock(), message="message is not modified"
+        )
+        self.assertEqual(await middleware(handler, rejected, {}), "done")
 
 
 class UserMutationLockMiddlewareTests(unittest.IsolatedAsyncioTestCase):

@@ -4,11 +4,12 @@ from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
-from ..catalog import MATERIALS
+from ..catalog import SELECTABLE_MATERIALS
 from ..i18n import translate as tr
 from ..keyboards import keyboard
 from ..parsing import parse_dimensions, parse_number
 from ..states import Survey
+from .common import bounded_text
 
 router = Router(name=__name__)
 
@@ -22,6 +23,7 @@ ORIENTATIONS = (
     "west",
     "north_west",
 )
+MAX_WALL_GROUPS = 12
 
 
 async def _locale(state: FSMContext) -> str:
@@ -38,15 +40,14 @@ def _material_name(key: str, locale: str) -> str:
 
 
 def _layer_items(prefix: str, locale: str) -> list[tuple[str, str]]:
-    items = [(_material_name(key, locale), f"{prefix}:{key}") for key in MATERIALS]
+    items = [(_material_name(key, locale), f"{prefix}:{key}") for key in SELECTABLE_MATERIALS]
     items.append((tr("wall.editor.passport", locale), f"{prefix}:custom"))
     return items
 
 
 def _orientation_items(locale: str) -> list[tuple[str, str]]:
     items = [
-        (tr(f"wall.editor.orientation.{value}", locale), f"wori:{value}")
-        for value in ORIENTATIONS
+        (tr(f"wall.editor.orientation.{value}", locale), f"wori:{value}") for value in ORIENTATIONS
     ]
     items.append((tr("wall.editor.orientation.unknown", locale), "wori:unknown"))
     return items
@@ -58,6 +59,39 @@ async def _ask_orientation(message: Message, state: FSMContext) -> None:
     await message.answer(
         tr("wall.editor.orientation", locale),
         reply_markup=keyboard(_orientation_items(locale), 2, locale=locale),
+    )
+
+
+async def _ask_material(message: Message, state: FSMContext) -> None:
+    locale = await _locale(state)
+    await state.set_state(Survey.wall_editor_material)
+    keys = ("brick_solid", "brick_hollow", "aerated_d500", "concrete", "wood")
+    items = [(_material_name(key, locale), f"wmat:{key}") for key in keys]
+    items.append((tr("wall.editor.passport", locale), "wmat:custom"))
+    await message.answer(
+        tr("wall.editor.material", locale), reply_markup=keyboard(items, 1, locale=locale)
+    )
+
+
+async def _ask_insulated(message: Message, state: FSMContext) -> None:
+    locale = await _locale(state)
+    await state.set_state(Survey.wall_editor_insulated)
+    await message.answer(
+        tr("wall.editor.insulated", locale),
+        reply_markup=keyboard(
+            [(tr("common.no", locale), "wins:no"), (tr("common.yes", locale), "wins:yes")],
+            2,
+            locale=locale,
+        ),
+    )
+
+
+async def _ask_insulation_material(message: Message, state: FSMContext) -> None:
+    locale = await _locale(state)
+    await state.set_state(Survey.wall_editor_insulation_material)
+    await message.answer(
+        tr("wall.editor.insulation", locale),
+        reply_markup=keyboard(_layer_items("wimat", locale), 1, locale=locale),
     )
 
 
@@ -85,12 +119,25 @@ async def ask_name(message: Message, state: FSMContext) -> None:
 
 @router.message(Survey.wall_editor_name)
 async def wall_name(message: Message, state: FSMContext) -> None:
-    name = (message.text or "").strip()
-    if not 1 <= len(name) <= 60:
+    try:
+        name = bounded_text(message.text, minimum=1, maximum=60, label="Название стены")
+    except ValueError:
         await _error(message, state, "wall.editor.error.name")
         return
     data = await state.get_data()
-    if any(item["name"].casefold() == name.casefold() for item in data.get("wall_groups", [])):
+    groups = data.get("wall_groups", [])
+    edit_index = data.get("wall_editor_edit_index")
+    if edit_index is not None and (
+        type(edit_index) is not int or not 0 <= edit_index < len(groups)
+    ):
+        await state.update_data(wall_editor_edit_index=None)
+        await _error(message, state, "wall.editor.error.stale")
+        await show_actions(message, state)
+        return
+    if any(
+        index != edit_index and item["name"].casefold() == name.casefold()
+        for index, item in enumerate(groups)
+    ):
         await _error(message, state, "wall.editor.error.duplicate", name=name)
         return
     await state.update_data(wall_editor_name=name)
@@ -128,13 +175,7 @@ async def wall_orientation(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer(tr("wall.editor.error.orientation", locale), show_alert=True)
         return
     await state.update_data(wall_editor_orientation=orientation)
-    await state.set_state(Survey.wall_editor_material)
-    keys = ("brick_solid", "brick_hollow", "aerated_d500", "concrete", "wood")
-    items = [(_material_name(key, locale), f"wmat:{key}") for key in keys]
-    items.append((tr("wall.editor.passport", locale), "wmat:custom"))
-    await callback.message.answer(
-        tr("wall.editor.material", locale), reply_markup=keyboard(items, 1, locale=locale)
-    )
+    await _ask_material(callback.message, state)
     await callback.answer()
 
 
@@ -145,10 +186,8 @@ async def wall_material(callback: CallbackQuery, state: FSMContext) -> None:
     if key == "custom":
         await state.set_state(Survey.wall_editor_custom_lambda)
         await callback.message.answer(tr("wall.editor.lambda", locale))
-    elif key in MATERIALS:
-        await state.update_data(
-            wall_editor_material=key, wall_editor_material_conductivity=None
-        )
+    elif key in SELECTABLE_MATERIALS:
+        await state.update_data(wall_editor_material=key, wall_editor_material_conductivity=None)
         await state.set_state(Survey.wall_editor_thickness)
         await callback.message.answer(
             tr("wall.editor.thickness", locale, material=_material_name(key, locale))
@@ -170,9 +209,7 @@ async def wall_custom_lambda(message: Message, state: FSMContext) -> None:
     except ValueError:
         await _error(message, state, "wall.editor.error.lambda")
         return
-    await state.update_data(
-        wall_editor_material="custom", wall_editor_material_conductivity=value
-    )
+    await state.update_data(wall_editor_material="custom", wall_editor_material_conductivity=value)
     await state.set_state(Survey.wall_editor_thickness)
     await message.answer(tr("wall.editor.base_thickness", await _locale(state)))
 
@@ -195,16 +232,7 @@ async def wall_thickness(message: Message, state: FSMContext) -> None:
             }
         ],
     )
-    await state.set_state(Survey.wall_editor_insulated)
-    locale = await _locale(state)
-    await message.answer(
-        tr("wall.editor.insulated", locale),
-        reply_markup=keyboard(
-            [(tr("common.no", locale), "wins:no"), (tr("common.yes", locale), "wins:yes")],
-            2,
-            locale=locale,
-        ),
-    )
+    await _ask_insulated(message, state)
 
 
 @router.callback_query(Survey.wall_editor_insulated, F.data.startswith("wins:"))
@@ -219,11 +247,7 @@ async def wall_insulated(callback: CallbackQuery, state: FSMContext) -> None:
         )
         await _finish_group(callback.message, state)
     elif value == "yes":
-        await state.set_state(Survey.wall_editor_insulation_material)
-        await callback.message.answer(
-            tr("wall.editor.insulation", locale),
-            reply_markup=keyboard(_layer_items("wimat", locale), 1, locale=locale),
-        )
+        await _ask_insulation_material(callback.message, state)
     else:
         await callback.answer(tr("wall.editor.error.option", locale), show_alert=True)
         return
@@ -237,7 +261,7 @@ async def insulation_material(callback: CallbackQuery, state: FSMContext) -> Non
     if key == "custom":
         await state.set_state(Survey.wall_editor_insulation_custom_lambda)
         await callback.message.answer(tr("wall.editor.insulation_lambda", locale))
-    elif key in MATERIALS:
+    elif key in SELECTABLE_MATERIALS:
         await state.update_data(
             wall_editor_insulation_material=key,
             wall_editor_insulation_conductivity=None,
@@ -286,9 +310,7 @@ async def insulation_thickness(message: Message, state: FSMContext) -> None:
             "thickness_m": value / 100,
         }
     )
-    await state.update_data(
-        wall_editor_insulation_thickness=value / 100, wall_editor_layers=layers
-    )
+    await state.update_data(wall_editor_insulation_thickness=value / 100, wall_editor_layers=layers)
     await state.set_state(Survey.wall_editor_more_layers)
     locale = await _locale(state)
     await message.answer(
@@ -336,7 +358,15 @@ async def more_layers(callback: CallbackQuery, state: FSMContext) -> None:
 async def _finish_group(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     groups = list(data.get("wall_groups", []))
-    if len(groups) >= 12:
+    edit_index = data.get("wall_editor_edit_index")
+    if edit_index is not None and (
+        type(edit_index) is not int or not 0 <= edit_index < len(groups)
+    ):
+        await state.update_data(wall_editor_edit_index=None)
+        await _error(message, state, "wall.editor.error.stale")
+        await show_actions(message, state)
+        return
+    if edit_index is None and len(groups) >= MAX_WALL_GROUPS:
         await _error(message, state, "wall.editor.error.wall_limit")
         return
     layers = list(data.get("wall_editor_layers", []))
@@ -353,9 +383,8 @@ async def _finish_group(message: Message, state: FSMContext) -> None:
         "insulation_thickness_m": legacy_insulation.get("thickness_m", 0.0),
         "layers": layers,
     }
-    edit_index = data.get("wall_editor_edit_index")
-    if isinstance(edit_index, int) and 0 <= edit_index <= len(groups):
-        groups.insert(edit_index, group)
+    if edit_index is not None:
+        groups[edit_index] = group
     else:
         groups.append(group)
     await state.update_data(wall_groups=groups, wall_editor_edit_index=None)
@@ -415,20 +444,20 @@ async def wall_action(callback: CallbackQuery, state: FSMContext) -> None:
     locale = str(data.get("locale") or "ru")
     groups = list(data.get("wall_groups", []))
     if action == "add":
-        if len(groups) >= 12:
-            await callback.answer(
-                tr("wall.editor.error.wall_limit_alert", locale), show_alert=True
-            )
+        if len(groups) >= MAX_WALL_GROUPS:
+            await callback.answer(tr("wall.editor.error.wall_limit_alert", locale), show_alert=True)
             return
         await ask_name(callback.message, state)
     elif action == "edit":
         try:
             index = int(parts[2])
-            groups.pop(index)
         except (IndexError, ValueError):
             await callback.answer(tr("wall.editor.error.stale", locale), show_alert=True)
             return
-        await state.update_data(wall_groups=groups, wall_editor_edit_index=index)
+        if not 0 <= index < len(groups):
+            await callback.answer(tr("wall.editor.error.stale", locale), show_alert=True)
+            return
+        await state.update_data(wall_editor_edit_index=index)
         await ask_name(callback.message, state)
     elif action == "delete":
         if not groups:
@@ -436,10 +465,13 @@ async def wall_action(callback: CallbackQuery, state: FSMContext) -> None:
             return
         try:
             index = int(parts[2]) if len(parts) > 2 else len(groups) - 1
-            groups.pop(index)
         except (IndexError, ValueError):
             await callback.answer(tr("wall.editor.error.stale", locale), show_alert=True)
             return
+        if not 0 <= index < len(groups):
+            await callback.answer(tr("wall.editor.error.stale", locale), show_alert=True)
+            return
+        groups.pop(index)
         await state.update_data(wall_groups=groups)
         if groups:
             await show_actions(callback.message, state)
@@ -456,7 +488,7 @@ async def wall_action(callback: CallbackQuery, state: FSMContext) -> None:
             insulation_material=None,
             insulation_thickness=0.0,
         )
-        from .survey import _ask_windows
+        from .openings import _ask_windows
 
         await _ask_windows(callback.message, state)
     else:
@@ -478,6 +510,15 @@ async def render_editor_step(message: Message, state: FSMContext) -> bool:
         return True
     if current == Survey.wall_editor_orientation.state:
         await _ask_orientation(message, state)
+        return True
+    if current == Survey.wall_editor_material.state:
+        await _ask_material(message, state)
+        return True
+    if current == Survey.wall_editor_insulated.state:
+        await _ask_insulated(message, state)
+        return True
+    if current == Survey.wall_editor_insulation_material.state:
+        await _ask_insulation_material(message, state)
         return True
     prompts = {
         Survey.wall_editor_name.state: "wall.editor.name",

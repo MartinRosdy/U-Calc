@@ -13,6 +13,7 @@ from ..i18n import translate as tr
 from ..keyboards import keyboard
 from ..parsing import parse_dimensions, parse_number
 from ..states import Survey
+from .common import bounded_text
 
 router = Router(name=__name__)
 
@@ -74,13 +75,24 @@ async def _ask_name(message: Message, state: FSMContext) -> None:
 
 @router.message(Survey.opening_editor_name)
 async def opening_name(message: Message, state: FSMContext) -> None:
-    name = (message.text or "").strip()
-    if not 1 <= len(name) <= 60:
+    try:
+        name = bounded_text(message.text, minimum=1, maximum=60, label="Название проёма")
+    except ValueError:
         await _error(message, state, "opening.editor.error.name_length")
         return
     data = await state.get_data()
     key, _, _ = _kind_data(data)
-    if any(item["name"].casefold() == name.casefold() for item in data.get(key, [])):
+    edit_index = data.get("opening_editor_edit_index")
+    groups = data.get(key, [])
+    if edit_index is not None and (
+        type(edit_index) is not int or not 0 <= edit_index < len(groups)
+    ):
+        await _error(message, state, "opening.editor.error.stale_group")
+        return
+    if any(
+        index != edit_index and item["name"].casefold() == name.casefold()
+        for index, item in enumerate(groups)
+    ):
         await _error(message, state, "opening.editor.error.duplicate", name=name)
         return
     await state.update_data(opening_editor_name=name)
@@ -92,7 +104,16 @@ async def opening_name(message: Message, state: FSMContext) -> None:
 async def opening_count(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     key, label, expected = _kind_data(data)
-    used = sum(int(item["count"]) for item in data.get(key, []))
+    groups = data.get(key, [])
+    edit_index = data.get("opening_editor_edit_index")
+    if edit_index is not None and (
+        type(edit_index) is not int or not 0 <= edit_index < len(groups)
+    ):
+        await _error(message, state, "opening.editor.error.stale_group")
+        return
+    used = sum(
+        int(item["count"]) for index, item in enumerate(groups) if index != edit_index
+    )
     try:
         value = int((message.text or "").strip())
     except ValueError:
@@ -145,7 +166,16 @@ async def opening_u_value(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     walls = data.get("wall_groups") or []
     if not walls:
-        await _save_group(message, state, None)
+        try:
+            await _save_group(message, state, None)
+        except ValueError as exc:
+            await message.answer(
+                tr(
+                    "opening.editor.retry",
+                    await _locale(state),
+                    message=str(exc),
+                )
+            )
         return
     await _ask_wall_selection(message, state, walls)
 
@@ -211,16 +241,26 @@ async def _save_group(message: Message, state: FSMContext, wall_name: str | None
     height = float(data["opening_editor_height"])
     area = count * width * height
     groups = list(data.get(key, []))
+    edit_index = data.get("opening_editor_edit_index")
+    if edit_index is not None and (
+        type(edit_index) is not int or not 0 <= edit_index < len(groups)
+    ):
+        raise ValueError(tr("opening.editor.error.stale_group", str(data.get("locale") or "ru")))
+    unchanged_groups = [
+        item for index, item in enumerate(groups) if index != edit_index
+    ]
     other_key = "door_groups" if key == "window_groups" else "window_groups"
     other_groups = data.get(other_key) or []
-    total_area = sum(float(item["area_m2"]) for item in [*groups, *other_groups]) + area
+    total_area = (
+        sum(float(item["area_m2"]) for item in [*unchanged_groups, *other_groups]) + area
+    )
     if total_area > float(data["wall_gross_area"]):
         raise ValueError(tr("opening.editor.error.total_area", str(data.get("locale") or "ru")))
     if wall_name:
         walls = {item["name"]: float(item["gross_area_m2"]) for item in data["wall_groups"]}
         assigned = sum(
             float(item["area_m2"])
-            for item in [*groups, *other_groups]
+            for item in [*unchanged_groups, *other_groups]
             if item.get("wall_name") == wall_name
         )
         if assigned + area > walls[wall_name]:
@@ -240,9 +280,8 @@ async def _save_group(message: Message, state: FSMContext, wall_name: str | None
         "u_value": float(data["opening_editor_u_value"]),
         "wall_name": wall_name,
     }
-    edit_index = data.get("opening_editor_edit_index")
-    if isinstance(edit_index, int) and 0 <= edit_index <= len(groups):
-        groups.insert(edit_index, group)
+    if edit_index is not None:
+        groups[edit_index] = group
     else:
         groups.append(group)
     await state.update_data(opening_editor_edit_index=None, **{key: groups})
@@ -320,14 +359,19 @@ async def opening_action(callback: CallbackQuery, state: FSMContext) -> None:
     elif action == "edit":
         try:
             index = int(parts[2])
-            groups.pop(index)
         except (IndexError, ValueError):
             await callback.answer(
                 tr("opening.editor.error.stale_group", await _locale(state)),
                 show_alert=True,
             )
             return
-        await state.update_data(opening_editor_edit_index=index, **{key: groups})
+        if not 0 <= index < len(groups):
+            await callback.answer(
+                tr("opening.editor.error.stale_group", await _locale(state)),
+                show_alert=True,
+            )
+            return
+        await state.update_data(opening_editor_edit_index=index)
         await _ask_name(callback.message, state)
     elif action == "delete":
         if not groups:
@@ -337,13 +381,19 @@ async def opening_action(callback: CallbackQuery, state: FSMContext) -> None:
             return
         try:
             index = int(parts[2]) if len(parts) > 2 else len(groups) - 1
-            groups.pop(index)
         except (IndexError, ValueError):
             await callback.answer(
                 tr("opening.editor.error.stale_group", await _locale(state)),
                 show_alert=True,
             )
             return
+        if not 0 <= index < len(groups):
+            await callback.answer(
+                tr("opening.editor.error.stale_group", await _locale(state)),
+                show_alert=True,
+            )
+            return
+        groups.pop(index)
         await state.update_data(**{key: groups})
         if groups:
             await _show_actions(callback.message, state)
@@ -364,7 +414,7 @@ async def opening_action(callback: CallbackQuery, state: FSMContext) -> None:
         area = sum(float(item["area_m2"]) for item in groups)
         if key == "window_groups":
             await state.update_data(window_area=area, window_type=None)
-            from .survey import _ask_doors
+            from .openings import _ask_doors
 
             await _ask_doors(callback.message, state)
         else:

@@ -1,3 +1,4 @@
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,11 +7,11 @@ from unittest.mock import patch
 
 from u_calc.calculator import calculate_heat_loss
 from u_calc.config import Settings
-from u_calc.handlers import bridge_editor, survey, wall_editor
+from u_calc.handlers import airflow, bridge_editor, climate, result, survey, wall_editor
 from u_calc.handlers import history as history_handlers
 from u_calc.models import Building, Layer, OpaqueSurface
 from u_calc.report import format_report
-from u_calc.services.building_factory import InvalidCalculationData
+from u_calc.services.building_factory import InvalidCalculationData, climate_from_answers
 from u_calc.services.calculation_service import CalculationBundle
 from u_calc.states import Survey
 from u_calc.storage import CalculationRepository
@@ -86,6 +87,80 @@ class SurveyCommandTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
+    async def test_global_error_handler_logs_calculation_reference_and_notifies_user(self) -> None:
+        message = FakeMessage(user_id=77)
+        state = FakeState({"locale": "ru", "calculation_request_id": "safe-request-reference"})
+        event = SimpleNamespace(
+            update=SimpleNamespace(message=message, callback_query=None, update_id=321),
+            exception=ValueError("synthetic failure"),
+        )
+        with (
+            patch("u_calc.handlers.survey.secrets.token_hex", return_value="a1b2c3d4"),
+            self.assertLogs("u_calc.handlers.survey", level="ERROR") as captured,
+        ):
+            handled = await survey.global_error_handler(event, self.repository, state)
+
+        self.assertTrue(handled)
+        self.assertIn("calculation_ref=safe-request-reference", "\n".join(captured.output))
+        self.assertIn("incident_id=a1b2c3d4", "\n".join(captured.output))
+        self.assertIn("Не удалось обработать", message.answers[-1][0])
+        self.assertIn("a1b2c3d4", message.answers[-1][0])
+
+    async def test_global_error_handler_rejects_log_injection_in_draft_reference(self) -> None:
+        message = FakeMessage(user_id=999)
+        state = FakeState({"calculation_request_id": "bad\nforged-log-entry"})
+        event = SimpleNamespace(
+            update=SimpleNamespace(message=message, callback_query=None, update_id=322),
+            exception=ValueError("synthetic failure"),
+        )
+        with (
+            patch("u_calc.handlers.survey.secrets.token_hex", return_value="11223344"),
+            self.assertLogs("u_calc.handlers.survey", level="ERROR") as captured,
+        ):
+            await survey.global_error_handler(event, self.repository, state)
+
+        rendered = "\n".join(captured.output)
+        self.assertIn("calculation_ref=None", rendered)
+        self.assertNotIn("forged-log-entry", rendered)
+        self.assertIn("11223344", message.answers[-1][0])
+        with sqlite3.connect(self.repository.path) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM user_settings WHERE telegram_user_id=999"
+                ).fetchone()[0],
+                0,
+            )
+
+    async def test_global_error_handler_logs_safe_application_handler_reference(self) -> None:
+        class BrokenState:
+            async def get_state(self):
+                raise RuntimeError("synthetic handler failure")
+
+        try:
+            await survey._current_state_name(BrokenState())
+        except RuntimeError as exception:
+            handler_exception = exception
+        else:  # pragma: no cover - defensive test guard
+            self.fail("Expected the synthetic handler failure")
+
+        message = FakeMessage(user_id=77)
+        event = SimpleNamespace(
+            update=SimpleNamespace(message=message, callback_query=None, update_id=323),
+            exception=handler_exception,
+        )
+        with (
+            patch("u_calc.handlers.survey.secrets.token_hex", return_value="55667788"),
+            self.assertLogs("u_calc.handlers.survey", level="ERROR") as captured,
+        ):
+            await survey.global_error_handler(event, self.repository)
+
+        rendered = "\n".join(captured.output)
+        self.assertIn(
+            "handler_ref=u_calc.handlers.survey._current_state_name",
+            rendered,
+        )
+        self.assertIn("incident_id=55667788", rendered)
+
     async def test_uzbek_primary_wizard_path_is_localized(self) -> None:
         self.repository.set_locale(77, "uz")
         await survey.start(self.message, self.state, self.repository)
@@ -97,11 +172,14 @@ class SurveyCommandTests(unittest.IsolatedAsyncioTestCase):
         object_message = FakeMessage("Yunusobod", 77)
         await survey.object_name(object_message, self.state)
         self.assertIn("iqlim", object_message.answers[-1][0])
-        await survey.climate(FakeCallback("climate:manual", self.message), self.state)
+        await climate.climate(FakeCallback("climate:manual", self.message), self.state)
         self.assertIn("tashqi harorat", self.message.answers[-1][0])
         outdoor_message = FakeMessage("-10", 77)
-        await survey.custom_outdoor(outdoor_message, self.state)
-        self.assertIn("Ichkarida", outdoor_message.answers[-1][0])
+        await climate.custom_outdoor(outdoor_message, self.state)
+        self.assertIn("manbasini", outdoor_message.answers[-1][0])
+        source_message = FakeMessage("Loyiha pasporti", 77)
+        await climate.manual_climate_source(source_message, self.state)
+        self.assertIn("Ichkarida", source_message.answers[-1][0])
         indoor_message = FakeMessage("24", 77)
         await survey.indoor(indoor_message, self.state)
         self.assertIn("geometriya", indoor_message.answers[-1][0])
@@ -115,6 +193,79 @@ class SurveyCommandTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertIn("⬅️ Orqaga", navigation)
         self.assertIn("✖️ Bekor qilish", navigation)
+
+    async def test_custom_climate_profile_is_validated_and_reaches_indoor_step(self) -> None:
+        self.state.data = {"locale": "ru"}
+        await climate.climate(FakeCallback("climate:custom", self.message), self.state)
+        self.assertEqual(self.state.state, Survey.custom_city_name)
+
+        steps = (
+            (climate.custom_city_name, "Бишкек", Survey.custom_cold_mean),
+            (climate.custom_cold_mean, "-3", Survey.custom_design),
+            (climate.custom_design, "-18", Survey.custom_extreme),
+            (climate.custom_extreme, "-32", Survey.custom_hot_mean),
+            (climate.custom_hot_mean, "25", Survey.custom_hot_max),
+        )
+        for handler, value, expected_state in steps:
+            with self.subTest(handler=handler.__name__):
+                await handler(FakeMessage(value, 77), self.state)
+                self.assertEqual(self.state.state, expected_state)
+
+        final = FakeMessage("42", 77)
+        await climate.custom_hot_max(final, self.state)
+        self.assertEqual(self.state.state, Survey.custom_source)
+        self.assertIn("источник", final.answers[-1][0].lower())
+        invalid_source = FakeMessage("x", 77)
+        await climate.custom_source(invalid_source, self.state)
+        self.assertEqual(self.state.state, Survey.custom_source)
+        self.assertIn("300", invalid_source.answers[-1][0])
+        source = FakeMessage("Кыргызгидромет, 1991–2020", 77)
+        await climate.custom_source(source, self.state)
+        self.assertEqual(self.state.state, Survey.scenario)
+        self.assertIn("Бишкек", source.answers[-1][0])
+
+        await climate.scenario(FakeCallback("scenario:design", self.message), self.state)
+        self.assertEqual(self.state.state, Survey.indoor)
+        self.assertEqual(self.state.data["outdoor"], -18.0)
+
+        corrupted = FakeState({"locale": "ru"}, state=Survey.custom_design)
+        invalid = FakeMessage("-10", 77)
+        await climate.custom_design(invalid, corrupted)
+        self.assertEqual(corrupted.state, Survey.custom_design)
+        self.assertIn("Попробуйте ещё раз", invalid.answers[-1][0])
+
+    async def test_builtin_design_temperature_requires_traceable_user_source(self) -> None:
+        self.state.data = {"locale": "ru", "climate_key": "tashkent"}
+        design = FakeMessage("-14", 77)
+        await climate.profile_design(design, self.state)
+        self.assertEqual(self.state.state, Survey.profile_design_source)
+        self.assertIn("источник", design.answers[-1][0].lower())
+
+        invalid = FakeMessage("x", 77)
+        await climate.profile_design_source(invalid, self.state)
+        self.assertEqual(self.state.state, Survey.profile_design_source)
+
+        source = FakeMessage("Проект ОВ, лист 3", 77)
+        await climate.profile_design_source(source, self.state)
+        self.assertEqual(self.state.state, Survey.scenario)
+        profile = climate_from_answers(self.state.data)
+        self.assertEqual(profile.provenance[-1].document, "Проект ОВ, лист 3")
+
+    async def test_uzbek_expert_import_prompts_are_localized(self) -> None:
+        self.state.data = {"locale": "uz"}
+
+        await survey.wall_method(FakeCallback("walls:groups", self.message), self.state)
+        self.assertIn("Har bir konstruksiyani", self.message.answers[-1][0])
+        self.assertNotIn("Каждая", self.message.answers[-1][0])
+
+        await survey.window_method(FakeCallback("window_method:groups", self.message), self.state)
+        self.assertIn("Har bir deraza guruhini", self.message.answers[-1][0])
+
+        await survey.door_method(FakeCallback("door_method:groups", self.message), self.state)
+        self.assertIn("Har bir eshik guruhini", self.message.answers[-1][0])
+
+        await survey.thermal_bridges(FakeCallback("bridges:import", self.message), self.state)
+        self.assertIn("Har bir issiqlik ko‘prigini", self.message.answers[-1][0])
 
     async def test_uzbek_quick_path_reaches_localized_confirmation(self) -> None:
         self.state.data = {
@@ -148,13 +299,13 @@ class SurveyCommandTests(unittest.IsolatedAsyncioTestCase):
         await survey.door_count(doors, self.state)
         self.assertIn("ventilyatsiya", doors.answers[-1][0])
 
-        await survey.air_changes(FakeCallback("ach:0.5", self.message), self.state)
+        await airflow.air_changes(FakeCallback("ach:0.5", self.message), self.state)
         self.assertIn("Rekuperator", self.message.answers[-1][0])
-        await survey.heat_recovery(FakeCallback("recovery:no", self.message), self.state)
+        await airflow.heat_recovery(FakeCallback("recovery:no", self.message), self.state)
         self.assertIn("sovuq ko‘priklari", self.message.answers[-1][0])
         await survey.thermal_bridges(FakeCallback("bridges:0.10", self.message), self.state)
         self.assertIn("ekspluatatsion zaxira", self.message.answers[-1][0])
-        await survey.safety_factor(FakeCallback("safety:1.10", self.message), self.state)
+        await result.safety_factor(FakeCallback("safety:1.10", self.message), self.state)
         self.assertIn("Hisoblashdan oldin", self.message.answers[-1][0])
         self.assertIn("Obyekt: Kvartira", self.message.answers[-1][0])
         self.assertIn("Iqlim: Harorat qo‘lda kiritilgan", self.message.answers[-1][0])
@@ -204,7 +355,7 @@ class SurveyCommandTests(unittest.IsolatedAsyncioTestCase):
             "calculation_mode": "advanced",
             "volume": 200.0,
         }
-        await survey._ask_air_changes(self.message, self.state)
+        await airflow._ask_air_changes(self.message, self.state)
         self.assertIn("Alohida hisobiy oqimlar", self.message.answers[-1][0])
         buttons = [
             button.text
@@ -213,33 +364,175 @@ class SurveyCommandTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertIn("Karralilik, 1/soat", buttons)
 
-        await survey.airflow_unit(
-            FakeCallback("airflow_unit:ach", self.message), self.state
-        )
+        await airflow.airflow_unit(FakeCallback("airflow_unit:ach", self.message), self.state)
         self.assertIn("mexanik ventilyatsiya", self.message.answers[-1][0])
         self.assertIn("1/soat", self.message.answers[-1][0])
 
         mechanical = FakeMessage("0,5", 77)
-        await survey.mechanical_ventilation(mechanical, self.state)
-        self.assertIn("tabiiy ventilyatsiya", mechanical.answers[-1][0])
+        await airflow.mechanical_ventilation(mechanical, self.state)
+        self.assertIn("tabiiy havo kirishi", mechanical.answers[-1][0])
         natural = FakeMessage("0,1", 77)
-        await survey.natural_ventilation(natural, self.state)
+        await airflow.natural_ventilation(natural, self.state)
         self.assertIn("infiltratsiya", natural.answers[-1][0])
         infiltration = FakeMessage("0,2", 77)
-        await survey.infiltration(infiltration, self.state)
+        await airflow.infiltration(infiltration, self.state)
         self.assertIn("rekuperatsiya", infiltration.answers[-1][0])
 
-        await survey.heat_recovery(
-            FakeCallback("recovery:yes", self.message), self.state
-        )
+        await airflow.heat_recovery(FakeCallback("recovery:yes", self.message), self.state)
         self.assertIn("pasportdagi FIK", self.message.answers[-1][0])
         efficiency = FakeMessage("70", 77)
-        await survey.heat_recovery_efficiency(efficiency, self.state)
+        await airflow.heat_recovery_efficiency(efficiency, self.state)
         self.assertIn("sovuq ko‘priklari", efficiency.answers[-1][0])
         self.assertEqual(self.state.data["mechanical_ventilation_m3_h"], 100.0)
         self.assertEqual(self.state.data["natural_ventilation_m3_h"], 20.0)
         self.assertEqual(self.state.data["infiltration_m3_h"], 40.0)
         self.assertEqual(self.state.data["heat_recovery_efficiency"], 0.7)
+        self.assertEqual(self.state.data["infiltration_basis"], "manual_flow")
+
+    async def test_appendix8_residential_infiltration_flow_and_validation(self) -> None:
+        self.state.data = {
+            "locale": "ru",
+            "calculation_mode": "advanced",
+            "airflow_input_basis": "components_m3h",
+            "mechanical_ventilation_m3_h": 0.0,
+            "natural_ventilation_m3_h": 0.0,
+            "length": 10.0,
+            "width": 8.0,
+            "volume": 240.0,
+            "indoor": 24.0,
+            "outdoor": -15.0,
+        }
+        await airflow._ask_infiltration(self.message, self.state)
+        buttons = [
+            button.text
+            for row in self.message.answers[-1][1]["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        self.assertTrue(any("3 м³/ч" in button for button in buttons))
+
+        await airflow.infiltration_method(
+            FakeCallback("infiltration_method:residential", self.message), self.state
+        )
+        self.assertEqual(self.state.state, Survey.infiltration_living_area)
+        invalid = FakeMessage("81", 77)
+        await airflow.infiltration_living_area(invalid, self.state)
+        self.assertEqual(self.state.state, Survey.infiltration_living_area)
+
+        valid = FakeMessage("50", 77)
+        await airflow.infiltration_living_area(valid, self.state)
+        self.assertEqual(self.state.data["infiltration_m3_h"], 150.0)
+        self.assertEqual(
+            self.state.data["infiltration_basis"],
+            "appendix8_residential_exhaust",
+        )
+        self.assertEqual(self.state.state, Survey.thermal_bridges)
+
+        stale = FakeCallback("infiltration_method:n50", self.message)
+        await airflow.infiltration_method(stale, self.state)
+        self.assertTrue(stale.answers[-1][1]["show_alert"])
+
+    async def test_appendix8_envelope_flow_validates_and_keeps_pressure_groups(self) -> None:
+        self.state.data = {
+            "locale": "ru",
+            "calculation_mode": "advanced",
+            "airflow_input_basis": "components_m3_h",
+            "mechanical_ventilation_m3_h": 0.0,
+            "natural_ventilation_m3_h": 0.0,
+            "length": 10.0,
+            "width": 8.0,
+            "volume": 240.0,
+        }
+        await airflow.infiltration_method(
+            FakeCallback("infiltration_method:envelope", self.message), self.state
+        )
+        self.assertEqual(self.state.state, Survey.infiltration_envelope)
+
+        invalid = FakeMessage("12 | 10 | 20", 77)
+        await airflow.infiltration_envelope(invalid, self.state)
+        self.assertEqual(self.state.state, Survey.infiltration_envelope)
+
+        valid = FakeMessage("12 | 10 | 20 | 0,5 | 100 | 0,2 | 0 | 0", 77)
+        await airflow.infiltration_envelope(valid, self.state)
+        self.assertEqual(self.state.state, Survey.infiltration_envelope_living_area)
+        self.assertEqual(self.state.data["infiltration_basis"], "appendix8_envelope")
+        self.assertEqual(len(self.state.data["infiltration_paths"]), 1)
+
+        living_area = FakeMessage("50", 77)
+        await airflow.infiltration_envelope_living_area(living_area, self.state)
+        self.assertEqual(self.state.data["infiltration_m3_h"], 150.0)
+        self.assertEqual(len(self.state.data["infiltration_paths"]), 1)
+        self.assertEqual(self.state.state, Survey.thermal_bridges)
+
+    async def test_appendix8_formula_four_flow_calculates_and_preserves_inputs(self) -> None:
+        self.state.data = {
+            "locale": "ru",
+            "calculation_mode": "advanced",
+            "airflow_input_basis": "components_m3_h",
+            "mechanical_ventilation_m3_h": 0.0,
+            "natural_ventilation_m3_h": 0.0,
+            "length": 10.0,
+            "width": 8.0,
+            "volume": 240.0,
+            "indoor": 24.0,
+            "outdoor": -15.0,
+        }
+        await airflow.infiltration_method(
+            FakeCallback("infiltration_method:envelope", self.message), self.state
+        )
+        await airflow.infiltration_pressure_method(
+            FakeCallback("pressure_method:formula4", self.message), self.state
+        )
+        self.assertEqual(self.state.state, Survey.infiltration_pressure_globals)
+
+        await airflow.infiltration_pressure_globals(
+            FakeMessage("12 | 1,3 | 5 | 0,8 | -0,6 | 1 | 0"), self.state
+        )
+        self.assertEqual(self.state.state, Survey.infiltration_pressure_groups)
+        await airflow.infiltration_pressure_groups(
+            FakeMessage("8 | 2,5 | 20 | 0,5 | 100 | 0,2 | 0 | 0"), self.state
+        )
+        self.assertEqual(self.state.state, Survey.infiltration_envelope_living_area)
+        path = self.state.data["infiltration_paths"][0]
+        self.assertGreater(path["pressure_pa"], 0)
+        self.assertEqual(path["pressure_input"]["opening_height_m"], 8)
+
+    async def test_airflow_rejects_stale_callbacks_and_skips_irrelevant_recovery(self) -> None:
+        self.state.data = {
+            "locale": "ru",
+            "calculation_mode": "quick",
+            "volume": 200.0,
+        }
+        invalid_unit = FakeCallback("airflow_unit:watts", self.message)
+        await airflow.airflow_unit(invalid_unit, self.state)
+        self.assertTrue(invalid_unit.answers[-1][1]["show_alert"])
+
+        advanced_only = FakeCallback("airflow_unit:m3h", self.message)
+        await airflow.airflow_unit(advanced_only, self.state)
+        self.assertTrue(advanced_only.answers[-1][1]["show_alert"])
+
+        self.state.data["calculation_mode"] = "advanced"
+        legacy_ach = FakeCallback("ach:0.5", self.message)
+        await airflow.air_changes(legacy_ach, self.state)
+        self.assertTrue(legacy_ach.answers[-1][1]["show_alert"])
+
+        await airflow.airflow_unit(FakeCallback("airflow_unit:m3h", self.message), self.state)
+        self.assertEqual(self.state.data["airflow_input_basis"], "components_m3_h")
+        invalid_flow = FakeMessage("nan", 77)
+        await airflow.mechanical_ventilation(invalid_flow, self.state)
+        self.assertIn("Попробуйте ещё раз", invalid_flow.answers[-1][0])
+        self.assertEqual(self.state.state, Survey.mechanical_ventilation)
+
+        await airflow.mechanical_ventilation(FakeMessage("0", 77), self.state)
+        await airflow.natural_ventilation(FakeMessage("0", 77), self.state)
+        final_flow = FakeMessage("0", 77)
+        await airflow.infiltration(final_flow, self.state)
+        self.assertEqual(self.state.state, Survey.thermal_bridges)
+        self.assertIn("мостики холода", final_flow.answers[-1][0])
+        self.assertEqual(self.state.data["heat_recovery_efficiency"], 0.0)
+
+        invalid_recovery = FakeCallback("recovery:unknown", self.message)
+        await airflow.heat_recovery(invalid_recovery, self.state)
+        self.assertTrue(invalid_recovery.answers[-1][1]["show_alert"])
 
     async def test_uzbek_neighbor_ground_zoning_and_validation_are_localized(self) -> None:
         self.state.data = {"locale": "uz", "active_boundary": "ground"}
@@ -266,9 +559,7 @@ class SurveyCommandTests(unittest.IsolatedAsyncioTestCase):
         await survey.ground_exterior_sides(complex_callback, self.state)
         self.assertIn("murakkab konturni", self.message.answers[-1][0])
 
-        await survey.ground_exterior_sides(
-            FakeCallback("gsides:n,e", self.message), self.state
-        )
+        await survey.ground_exterior_sides(FakeCallback("gsides:n,e", self.message), self.state)
         self.assertIn("Grunt ustidagi pol konstruksiyasi", self.message.answers[-1][0])
         await survey.ground_floor_construction(
             FakeCallback("ground_floor:solid", self.message), self.state
@@ -309,7 +600,7 @@ class SurveyCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Eshik turi", door_area.answers[-1][0])
 
     async def test_help_history_report_copy_and_compare_commands(self) -> None:
-        await history_handlers.help_command(self.message)
+        await history_handlers.help_command(self.message, self.repository)
         self.assertIn("/new", self.message.answers[-1][0])
         settings = Settings(bot_token="secret", database_path=self.repository.path)
         await history_handlers.history(self.message, self.repository, settings)
@@ -355,7 +646,8 @@ class SurveyCommandTests(unittest.IsolatedAsyncioTestCase):
         await history_handlers.compare_calculations(same_compare, self.repository)
         diff_compare = FakeMessage(f"/compare {first} {second}")
         await history_handlers.compare_calculations(diff_compare, self.repository)
-        self.assertIn("indoor", diff_compare.answers[-1][0])
+        self.assertIn("Внутренняя температура, °C: 20 → 22", diff_compare.answers[-1][0])
+        self.assertNotIn("indoor", diff_compare.answers[-1][0])
 
     async def test_draft_survives_restart_resume_and_discard(self) -> None:
         empty = FakeMessage()
@@ -368,11 +660,78 @@ class SurveyCommandTests(unittest.IsolatedAsyncioTestCase):
         await survey.resume_draft(self.message, self.state, restarted)
         self.assertEqual(self.state.state, Survey.wall_thickness.state)
         self.assertEqual(self.state.data["wall_material"], "brick")
-        self.assertIn("толщину", self.message.answers[-1][0])
+        self.assertIn("толщин", self.message.answers[-1][0].lower())
         await survey.discard_draft(self.message, self.state, restarted)
         self.assertIsNone(restarted.load_draft(77))
         await survey.discard_draft(self.message, self.state, restarted)
         self.assertIn("нет", self.message.answers[-1][0])
+
+    async def test_deep_uzbek_resume_steps_restore_real_prompts_and_keyboards(self) -> None:
+        base = {
+            "locale": "uz",
+            "calculation_mode": "advanced",
+            "climate_key": "tashkent",
+            "active_surface": "floor",
+            "active_boundary": "ground",
+            "floor_ground_method": "zonal",
+            "airflow_input_basis": "components_ach",
+            "volume": 240.0,
+        }
+        cases = (
+            (Survey.climate, {}, "iqlim", True),
+            (Survey.profile_design, {}, "B parametr", False),
+            (Survey.profile_design_source, {"confirmed_design_c": -14.0}, "manbasini", False),
+            (Survey.scenario, {"confirmed_design_c": -14.0}, "Hisobiy sovuq", True),
+            (Survey.custom_outdoor, {}, "tashqi harorat", False),
+            (Survey.manual_climate_source, {"outdoor": -14.0}, "manbasini", False),
+            (Survey.custom_city_name, {}, "shahar", False),
+            (Survey.custom_cold_mean, {}, "sovuq oyning", False),
+            (Survey.custom_design, {}, "hisobiy harorat", False),
+            (Survey.custom_extreme, {}, "mutlaq minimum", False),
+            (Survey.custom_hot_mean, {}, "issiq oyning", False),
+            (Survey.custom_hot_max, {}, "mutlaq maksimum", False),
+            (Survey.custom_source, {}, "manbasini", False),
+            (Survey.wall_groups, {}, "Har bir konstruksiyani", False),
+            (Survey.wall_material, {}, "asosiy materiali", True),
+            (Survey.insulated, {}, "izolyatsiyasi", True),
+            (Survey.insulation_material, {}, "izolyatsiyasi", True),
+            (Survey.wall_editor_material, {}, "materiali", True),
+            (Survey.wall_editor_insulated, {}, "izolyatsiyasi", True),
+            (Survey.wall_editor_insulation_material, {}, "Izolyatsiya materiali", True),
+            (Survey.window_method, {}, "Derazalarni", True),
+            (Survey.window_type, {}, "Deraza turi", True),
+            (Survey.door_method, {}, "eshiklarni", True),
+            (Survey.floor_boundary, {}, "Pol ostida", True),
+            (Survey.surface_adjacent_mode, {}, "harorati", True),
+            (Survey.ground_exterior_sides, {}, "tomonlari", True),
+            (Survey.ground_floor_construction, {}, "konstruksiyasi", True),
+            (Survey.surface_material, {}, "asosiy materiali", True),
+            (Survey.surface_insulated, {}, "izolyatsiya", True),
+            (Survey.surface_insulation_material, {}, "izolyatsiya", True),
+            (Survey.air_changes, {}, "alohida hisobiy", True),
+            (Survey.mechanical_ventilation, {}, "mexanik", False),
+            (Survey.natural_ventilation, {}, "tabiiy havo kirishi", False),
+            (Survey.infiltration, {}, "infiltratsiya", True),
+            (Survey.infiltration_living_area, {}, "yashash xonalari", False),
+            (Survey.infiltration_envelope, {}, "3-formulasi", False),
+            (Survey.infiltration_envelope_living_area, {}, "turar joy", False),
+            (Survey.heat_recovery, {}, "rekuperatsiya", True),
+            (Survey.thermal_bridges, {}, "sovuq ko‘priklari", True),
+            (Survey.thermal_bridge_details, {}, "Har bir issiqlik", False),
+            (Survey.safety_factor, {}, "ekspluatatsion zaxira", True),
+            (Survey.confirmation, {}, "Hisoblashdan oldin", True),
+        )
+
+        for step, extra, expected, has_keyboard in cases:
+            with self.subTest(step=step.state):
+                message = FakeMessage()
+                state = FakeState({**base, **extra}, state=step)
+                await survey._render_current_step(message, state)
+                self.assertTrue(message.answers)
+                text, kwargs = message.answers[-1]
+                self.assertIn(expected.lower(), text.lower())
+                self.assertNotIn("Qadam tiklandi", text)
+                self.assertEqual("reply_markup" in kwargs, has_keyboard)
 
     async def test_back_cancel_and_history_delete_callbacks_are_acknowledged(self) -> None:
         await survey.back_command(self.message, self.state)
@@ -402,7 +761,7 @@ class SurveyCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(callback.answers)
 
         self.repository.save(77, {}, 1, 1.1, "r")
-        await history_handlers.delete_history_prompt(self.message)
+        await history_handlers.delete_history_prompt(self.message, self.repository)
         cancelled = FakeCallback("delete_history:cancel", self.message)
         await history_handlers.delete_history(cancelled, self.repository)
         deleted = FakeCallback("delete_history:confirm", self.message)
@@ -443,9 +802,10 @@ class SurveyCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.state.state, Survey.wall_editor_name)
         await wall_editor.wall_name(FakeMessage("Север", 77), self.state)
         await wall_editor.wall_area(FakeMessage("6x3", 77), self.state)
-        await wall_editor.wall_orientation(
-            FakeCallback("wori:north", self.message), self.state
-        )
+        await wall_editor.wall_orientation(FakeCallback("wori:north", self.message), self.state)
+        legacy_material = FakeCallback("wmat:pu_foam", self.message)
+        await wall_editor.wall_material(legacy_material, self.state)
+        self.assertTrue(legacy_material.answers[-1][1]["show_alert"])
         await wall_editor.wall_material(FakeCallback("wmat:brick_solid", self.message), self.state)
         await wall_editor.wall_thickness(FakeMessage("25", 77), self.state)
         await wall_editor.wall_insulated(FakeCallback("wins:no", self.message), self.state)
@@ -490,14 +850,18 @@ class SurveyCommandTests(unittest.IsolatedAsyncioTestCase):
             ],
         }
         await wall_editor.wall_action(FakeCallback("wedit:edit:0", self.message), self.state)
+        self.assertEqual(
+            [item["name"] for item in self.state.data["wall_groups"]],
+            ["Север", "Юг"],
+        )
+        duplicate = FakeMessage("юг", 77)
+        await wall_editor.wall_name(duplicate, self.state)
+        self.assertIn("уже использовано", duplicate.answers[-1][0])
+        self.assertEqual(self.state.state, Survey.wall_editor_name)
         await wall_editor.wall_name(FakeMessage("Север новый", 77), self.state)
         await wall_editor.wall_area(FakeMessage("24", 77), self.state)
-        await wall_editor.wall_orientation(
-            FakeCallback("wori:north", self.message), self.state
-        )
-        await wall_editor.wall_material(
-            FakeCallback("wmat:aerated_d500", self.message), self.state
-        )
+        await wall_editor.wall_orientation(FakeCallback("wori:north", self.message), self.state)
+        await wall_editor.wall_material(FakeCallback("wmat:aerated_d500", self.message), self.state)
         await wall_editor.wall_thickness(FakeMessage("30", 77), self.state)
         await wall_editor.wall_insulated(FakeCallback("wins:no", self.message), self.state)
         self.assertEqual(
@@ -506,13 +870,49 @@ class SurveyCommandTests(unittest.IsolatedAsyncioTestCase):
         )
 
         await wall_editor.wall_action(FakeCallback("wedit:delete:1", self.message), self.state)
-        self.assertEqual(
-            [item["name"] for item in self.state.data["wall_groups"]], ["Север новый"]
-        )
+        self.assertEqual([item["name"] for item in self.state.data["wall_groups"]], ["Север новый"])
 
         stale = FakeCallback("wedit:delete:9", self.message)
         await wall_editor.wall_action(stale, self.state)
         self.assertTrue(stale.answers[-1][1]["show_alert"])
+
+    async def test_wall_editor_rejects_negative_indexes_without_mutation(self) -> None:
+        original = [{"name": "Север", "gross_area_m2": 20}]
+        self.state.data = {"locale": "ru", "wall_groups": list(original)}
+
+        for action in ("wedit:edit:-1", "wedit:delete:-1"):
+            callback = FakeCallback(action, self.message)
+            await wall_editor.wall_action(callback, self.state)
+            self.assertTrue(callback.answers[-1][1]["show_alert"])
+            self.assertEqual(self.state.data["wall_groups"], original)
+
+    async def test_wall_editor_can_atomically_replace_a_full_collection(self) -> None:
+        groups = [
+            {"name": f"Стена {index}", "gross_area_m2": 10.0}
+            for index in range(12)
+        ]
+        self.state.data = {
+            "locale": "ru",
+            "wall_groups": groups,
+            "wall_editor_edit_index": 0,
+            "wall_editor_name": "Новая стена",
+            "wall_editor_area": 12.0,
+            "wall_editor_orientation": "north",
+            "wall_editor_material": "brick_solid",
+            "wall_editor_material_conductivity": None,
+            "wall_editor_thickness": 0.25,
+            "wall_editor_layers": [
+                {
+                    "material": "brick_solid",
+                    "material_conductivity": None,
+                    "thickness_m": 0.25,
+                }
+            ],
+        }
+        await wall_editor._finish_group(self.message, self.state)
+
+        self.assertEqual(len(self.state.data["wall_groups"]), 12)
+        self.assertEqual(self.state.data["wall_groups"][0]["name"], "Новая стена")
 
     async def test_step_by_step_bridge_editor_validates_and_finishes(self) -> None:
         await survey.thermal_bridges(FakeCallback("bridges:exact", self.message), self.state)
@@ -561,9 +961,15 @@ class SurveyCommandTests(unittest.IsolatedAsyncioTestCase):
                 {"name": "Перемычка", "length_m": 6.0, "psi_w_mk": 0.2},
             ],
         }
-        await bridge_editor.bridge_action(
-            FakeCallback("bedit:edit:0", self.message), self.state
+        await bridge_editor.bridge_action(FakeCallback("bedit:edit:0", self.message), self.state)
+        self.assertEqual(
+            [item["name"] for item in self.state.data["linear_thermal_bridges"]],
+            ["Балкон", "Перемычка"],
         )
+        duplicate = FakeMessage("перемычка", 77)
+        await bridge_editor.bridge_name(duplicate, self.state)
+        self.assertIn("уже используется", duplicate.answers[-1][0])
+        self.assertEqual(self.state.state, Survey.bridge_editor_name)
         await bridge_editor.bridge_name(FakeMessage("Балкон новый", 77), self.state)
         await bridge_editor.bridge_length(FakeMessage("5", 77), self.state)
         await bridge_editor.bridge_psi(FakeMessage("0,25", 77), self.state)
@@ -572,9 +978,7 @@ class SurveyCommandTests(unittest.IsolatedAsyncioTestCase):
             ["Балкон новый", "Перемычка"],
         )
 
-        await bridge_editor.bridge_action(
-            FakeCallback("bedit:delete:1", self.message), self.state
-        )
+        await bridge_editor.bridge_action(FakeCallback("bedit:delete:1", self.message), self.state)
         self.assertEqual(
             [item["name"] for item in self.state.data["linear_thermal_bridges"]],
             ["Балкон новый"],
@@ -582,6 +986,127 @@ class SurveyCommandTests(unittest.IsolatedAsyncioTestCase):
         stale = FakeCallback("bedit:edit:9", self.message)
         await bridge_editor.bridge_action(stale, self.state)
         self.assertTrue(stale.answers[-1][1]["show_alert"])
+
+    async def test_bridge_editor_rejects_negative_indexes_without_mutation(self) -> None:
+        original = [{"name": "Балкон", "length_m": 4.0, "psi_w_mk": 0.3}]
+        self.state.data = {"locale": "ru", "linear_thermal_bridges": list(original)}
+
+        for action in ("bedit:edit:-1", "bedit:delete:-1"):
+            callback = FakeCallback(action, self.message)
+            await bridge_editor.bridge_action(callback, self.state)
+            self.assertTrue(callback.answers[-1][1]["show_alert"])
+            self.assertEqual(self.state.data["linear_thermal_bridges"], original)
+
+    async def test_bridge_editor_recovers_a_corrupt_resumed_draft(self) -> None:
+        self.state.data = {"locale": "ru", "linear_thermal_bridges": "not-a-list"}
+        self.state.state = Survey.bridge_editor_action
+
+        self.assertTrue(await bridge_editor.render_editor_step(self.message, self.state))
+        self.assertEqual(self.state.state, Survey.bridge_editor_name)
+        self.assertEqual(self.state.data["linear_thermal_bridges"], [])
+        self.assertIn("повреждены", self.message.answers[-2][0])
+
+    async def test_bridge_editor_can_atomically_edit_a_full_collection(self) -> None:
+        bridges = [
+            {"name": f"Мостик {index}", "length_m": 1.0, "psi_w_mk": 0.1}
+            for index in range(30)
+        ]
+        self.state.data = {"locale": "ru", "linear_thermal_bridges": bridges}
+        await bridge_editor.bridge_action(FakeCallback("bedit:edit:0", self.message), self.state)
+        self.assertEqual(len(self.state.data["linear_thermal_bridges"]), 30)
+        await bridge_editor.bridge_name(FakeMessage("Новый мостик", 77), self.state)
+        await bridge_editor.bridge_length(FakeMessage("2", 77), self.state)
+        await bridge_editor.bridge_psi(FakeMessage("0,2", 77), self.state)
+
+        self.assertEqual(len(self.state.data["linear_thermal_bridges"]), 30)
+        self.assertEqual(self.state.data["linear_thermal_bridges"][0]["name"], "Новый мостик")
+
+    async def test_bridge_editor_rejects_invalid_fields_and_full_collection_add(self) -> None:
+        self.state.data = {"locale": "ru", "linear_thermal_bridges": []}
+        invalid_name = FakeMessage("", 77)
+        await bridge_editor.bridge_name(invalid_name, self.state)
+        self.assertIn("от 1 до 60", invalid_name.answers[-1][0])
+
+        invalid_length = FakeMessage("0", 77)
+        await bridge_editor.bridge_length(invalid_length, self.state)
+        self.assertIn("0,01", invalid_length.answers[-1][0])
+
+        self.state.data.update(
+            linear_thermal_bridges=[
+                {"name": f"Мостик {index}", "length_m": 1.0, "psi_w_mk": 0.1}
+                for index in range(30)
+            ],
+            bridge_editor_name="Лишний",
+            bridge_editor_length=1.0,
+            bridge_editor_edit_index=None,
+        )
+        invalid_add = FakeMessage("0,2", 77)
+        await bridge_editor.bridge_psi(invalid_add, self.state)
+        self.assertIn("не более 30", invalid_add.answers[-1][0])
+
+        add_callback = FakeCallback("bedit:add", self.message)
+        await bridge_editor.bridge_action(add_callback, self.state)
+        self.assertTrue(add_callback.answers[-1][1]["show_alert"])
+
+    async def test_bridge_editor_handles_stale_empty_and_unknown_actions(self) -> None:
+        self.state.data = {"locale": "ru", "linear_thermal_bridges": []}
+        for action, expected in (
+            ("bedit:edit", "недоступен"),
+            ("bedit:edit:not-a-number", "недоступен"),
+            ("bedit:delete", "уже пуст"),
+            ("bedit:finish", "хотя бы один"),
+            ("bedit:unexpected", "Неизвестное"),
+        ):
+            callback = FakeCallback(action, self.message)
+            await bridge_editor.bridge_action(callback, self.state)
+            self.assertIn(expected, callback.answers[-1][0])
+            self.assertTrue(callback.answers[-1][1]["show_alert"])
+
+        self.state.data["linear_thermal_bridges"] = [
+            {"name": "Балкон", "length_m": 4.0, "psi_w_mk": 0.3}
+        ]
+        malformed_delete = FakeCallback("bedit:delete:no", self.message)
+        await bridge_editor.bridge_action(malformed_delete, self.state)
+        self.assertTrue(malformed_delete.answers[-1][1]["show_alert"])
+
+        delete_last = FakeCallback("bedit:delete", self.message)
+        await bridge_editor.bridge_action(delete_last, self.state)
+        self.assertEqual(self.state.data["linear_thermal_bridges"], [])
+        self.assertEqual(self.state.state, Survey.bridge_editor_name)
+
+    async def test_bridge_editor_recovers_corrupt_callback_and_pending_edit(self) -> None:
+        self.state.data = {"locale": "uz", "linear_thermal_bridges": ["bad-row"]}
+        callback = FakeCallback("bedit:add", self.message)
+        await bridge_editor.bridge_action(callback, self.state)
+        self.assertTrue(callback.answers[-1][1]["show_alert"])
+        self.assertEqual(self.state.data["linear_thermal_bridges"], [])
+        self.assertEqual(self.state.state, Survey.bridge_editor_name)
+
+        self.state.data.update(
+            linear_thermal_bridges=[
+                {"name": "Balkon", "length_m": 4.0, "psi_w_mk": 0.3}
+            ],
+            bridge_editor_name=None,
+            bridge_editor_length=4.0,
+            bridge_editor_edit_index=0,
+        )
+        message = FakeMessage("0,2", 77)
+        await bridge_editor.bridge_psi(message, self.state)
+        self.assertEqual(self.state.data["linear_thermal_bridges"], [])
+        self.assertIn("buzilgan", message.answers[-2][0])
+
+    async def test_bridge_editor_restore_prompts_and_unrelated_state(self) -> None:
+        self.state.data = {"locale": "ru", "linear_thermal_bridges": []}
+        for current, expected in (
+            (Survey.bridge_editor_name, "Название"),
+            (Survey.bridge_editor_length, "длина"),
+            (Survey.bridge_editor_psi, "коэффициент"),
+        ):
+            self.state.state = current
+            self.assertTrue(await bridge_editor.render_editor_step(self.message, self.state))
+            self.assertIn(expected.casefold(), self.message.answers[-1][0].casefold())
+        self.state.state = Survey.indoor
+        self.assertFalse(await bridge_editor.render_editor_step(self.message, self.state))
 
     async def test_uzbek_wall_editor_layers_and_restore_are_localized(self) -> None:
         self.state.data = {"locale": "uz", "profile_defaults": {}}
@@ -596,9 +1121,7 @@ class SurveyCommandTests(unittest.IsolatedAsyncioTestCase):
         area = FakeMessage("6x3", 77)
         await wall_editor.wall_area(area, self.state)
         self.assertIn("Tashqi devor yo‘nalishi", area.answers[-1][0])
-        await wall_editor.wall_orientation(
-            FakeCallback("wori:north", self.message), self.state
-        )
+        await wall_editor.wall_orientation(FakeCallback("wori:north", self.message), self.state)
         material_buttons = [
             button.text
             for row in self.message.answers[-1][1]["reply_markup"].inline_keyboard
@@ -607,9 +1130,7 @@ class SurveyCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("To‘liq g‘isht", material_buttons)
         self.assertIn("⬅️ Orqaga", material_buttons)
 
-        await wall_editor.wall_material(
-            FakeCallback("wmat:brick_solid", self.message), self.state
-        )
+        await wall_editor.wall_material(FakeCallback("wmat:brick_solid", self.message), self.state)
         await wall_editor.wall_thickness(FakeMessage("25", 77), self.state)
         await wall_editor.wall_insulated(FakeCallback("wins:yes", self.message), self.state)
         await wall_editor.insulation_material(
@@ -633,18 +1154,38 @@ class SurveyCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("✖️ Bekor qilish", action_buttons)
         self.assertTrue(await wall_editor.render_editor_step(self.message, self.state))
 
+    def test_confirmation_card_survives_corrupted_draft_values(self) -> None:
+        text = result._confirmation_text(
+            {
+                "locale": "xx",
+                "building_type": ["house"],
+                "climate_key": "custom",
+                "custom_city_name": [],
+                "wall_gross_area": "not-a-number",
+                "window_area": float("nan"),
+                "door_area": {},
+                "mechanical_ventilation_m3_h": [],
+                "outdoor": None,
+                "indoor": True,
+                "length": "bad",
+                "safety_factor": "inf",
+            }
+        )
+        self.assertIn("объект", text)
+        self.assertGreaterEqual(text.count("—"), 7)
+
     async def test_confirmation_handles_domain_internal_db_and_pdf_failures(self) -> None:
         invalid = FakeCallback("confirm:calculate", self.message)
         with patch(
-            "u_calc.handlers.survey.calculate_from_answers",
+            "u_calc.handlers.result.calculate_from_answers",
             side_effect=InvalidCalculationData("нет стены"),
         ):
-            await survey.confirmation(invalid, self.state, self.repository)
+            await result.confirmation(invalid, self.state, self.repository)
         self.assertIn("нет стены", self.message.answers[-1][0])
 
         internal = FakeCallback("confirm:calculate", self.message)
-        with patch("u_calc.handlers.survey.calculate_from_answers", side_effect=RuntimeError("x")):
-            await survey.confirmation(internal, self.state, self.repository)
+        with patch("u_calc.handlers.result.calculate_from_answers", side_effect=RuntimeError("x")):
+            await result.confirmation(internal, self.state, self.repository)
         self.assertIn("внутренней ошибки", self.message.answers[-1][0])
 
         class BrokenRepository:
@@ -654,10 +1195,10 @@ class SurveyCommandTests(unittest.IsolatedAsyncioTestCase):
         self.state = FakeState({"object_name": "Несохранённый", "calculation_request_id": "id"})
         callback = FakeCallback("confirm:calculate", self.message)
         with (
-            patch("u_calc.handlers.survey.calculate_from_answers", return_value=sample_bundle()),
+            patch("u_calc.handlers.result.calculate_from_answers", return_value=sample_bundle()),
             patch("u_calc.pdf_report.build_pdf_report", return_value=b"%PDF-test"),
         ):
-            await survey.confirmation(callback, self.state, BrokenRepository())
+            await result.confirmation(callback, self.state, BrokenRepository())
         self.assertIn("не сохранён", self.message.answers[-2][0])
         self.assertEqual(self.message.documents[-1][0].filename, "u-calc-unsaved.pdf")
         self.assertIsNone(self.state.state)
@@ -665,10 +1206,10 @@ class SurveyCommandTests(unittest.IsolatedAsyncioTestCase):
         self.state = FakeState({"object_name": "PDF error"})
         callback = FakeCallback("confirm:calculate", self.message)
         with (
-            patch("u_calc.handlers.survey.calculate_from_answers", return_value=sample_bundle()),
+            patch("u_calc.handlers.result.calculate_from_answers", return_value=sample_bundle()),
             patch("u_calc.pdf_report.build_pdf_report", side_effect=RuntimeError("font")),
         ):
-            await survey.confirmation(callback, self.state, self.repository)
+            await result.confirmation(callback, self.state, self.repository)
         self.assertIn("PDF создать не удалось", self.message.answers[-2][0])
 
     async def test_uzbek_completed_calculation_summary_and_pdf_caption_are_localized(self) -> None:
@@ -682,10 +1223,10 @@ class SurveyCommandTests(unittest.IsolatedAsyncioTestCase):
         message = FakeMessage()
         callback = FakeCallback("confirm:calculate", message)
         with (
-            patch("u_calc.handlers.survey.calculate_from_answers", return_value=sample_bundle()),
+            patch("u_calc.handlers.result.calculate_from_answers", return_value=sample_bundle()),
             patch("u_calc.pdf_report.build_pdf_report", return_value=b"%PDF-test"),
         ):
-            await survey.confirmation(callback, state, self.repository)
+            await result.confirmation(callback, state, self.repository)
 
         self.assertIn("Hisob №", message.answers[0][0])
         self.assertIn("🔥 Hisob tayyor: Yunusobod uyi", message.answers[0][0])
@@ -704,17 +1245,17 @@ class SurveyCommandTests(unittest.IsolatedAsyncioTestCase):
         ):
             state = FakeState()
             callback = FakeCallback(f"confirm:{action}", self.message)
-            await survey.confirmation(callback, state, self.repository)
+            await result.confirmation(callback, state, self.repository)
             self.assertEqual(state.state, expected)
             self.assertTrue(callback.answers)
         stale = FakeCallback("confirm:old-screen", self.message)
-        await survey.confirmation(stale, FakeState(), self.repository)
+        await result.confirmation(stale, FakeState(), self.repository)
         self.assertTrue(stale.answers[-1][1]["show_alert"])
 
     async def test_uzbek_confirmation_edit_screens_keep_full_localized_options(self) -> None:
         state = FakeState({"locale": "uz"})
         walls_message = FakeMessage()
-        await survey.confirmation(
+        await result.confirmation(
             FakeCallback("confirm:walls", walls_message), state, self.repository
         )
         wall_buttons = [
@@ -727,7 +1268,7 @@ class SurveyCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("⬅️ Orqaga", wall_buttons)
 
         boundaries_message = FakeMessage()
-        await survey.confirmation(
+        await result.confirmation(
             FakeCallback("confirm:boundaries", boundaries_message), state, self.repository
         )
         self.assertIn("Pol ostida nima bor", boundaries_message.answers[-1][0])
@@ -740,7 +1281,7 @@ class SurveyCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("✖️ Bekor qilish", boundary_buttons)
 
         stale = FakeCallback("confirm:missing", FakeMessage())
-        await survey.confirmation(stale, state, self.repository)
+        await result.confirmation(stale, state, self.repository)
         self.assertEqual(stale.answers[-1][0], "Noma’lum amal")
 
     async def test_unmatched_stale_callback_is_always_acknowledged(self) -> None:

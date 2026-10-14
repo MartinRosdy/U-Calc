@@ -2,6 +2,13 @@
 .env
 .env.*
 !.env.example
+.envrc
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+secrets.json
 
 # Python
 .venv/
@@ -16,13 +23,19 @@ pip-wheel-metadata/
 
 # Tests, type checking and coverage
 .pytest_cache/
+.hypothesis/
 .ruff_cache/
 .mypy_cache/
 .pyright/
+.pytype/
+.tox/
+.nox/
+.cache/
 .coverage
 .coverage.*
 coverage.xml
 htmlcov/
+pytestdebug.log
 
 # Builds
 dist/
@@ -48,6 +61,7 @@ __MACOSX/
 .vscode/
 *.swp
 *.swo
+*~
 
 # Docker/local overrides
 compose.override.yaml

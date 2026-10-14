@@ -1,4 +1,4 @@
-# UX-трассировка beta
+# UX-трассировка продукта
 
 Исходные 17 PNG, упомянутые во внешней спецификации, в переданном workspace и соседних
 каталогах не обнаружены. Поэтому изображение нельзя честно связать с конкретной реализацией
@@ -31,15 +31,18 @@
 | Требование | Реализация | Проверка | Статус |
 |---|---|---|---|
 | Главное меню без знания команд | `handlers/menu.py` | router/keyboard tests и ручной smoke test | реализовано |
-| RU/UZ Latin и равенство ключей | `i18n.py` | `tests/test_i18n.py`, сквозные UZ-тесты в `test_survey_resilience.py`, `test_report.py`, `test_uzbek_editor_happy_path_and_navigation_are_localized` | основные пути квартиры и дома, пол/потолок, редакторы стен/проёмов/мостиков, карточка исправления и краткий итог Telegram реализованы; часть углублённых ошибок и подробный PDF ещё не полностью переведена |
+| История и версии без знания команд | карточки `h:view/report/copy/compare/delete` в `handlers/history.py`; локализованные RU/UZ-команды оставлены как быстрый путь | `tests/test_menu_flow.py`, `tests/test_storage.py`, `tests/test_survey_resilience.py` | просмотр, дата и автор версии, отчёт, новая версия, локализованное сравнение без служебных полей/request ID и точечное удаление реализованы кнопками и командами |
+| RU/UZ Latin и равенство ключей | `i18n.py` | `tests/test_i18n.py`, сквозные UZ-тесты в `test_survey_resilience.py`, `test_report.py`, `test_uzbek_editor_happy_path_and_navigation_are_localized` | основные пути квартиры и дома, пол/потолок, редакторы и экспертный импорт стен/проёмов/мостиков, карточка исправления, итог Telegram и полный инженерный PDF реализованы |
 | CRUD профилей кнопками, подтверждение удаления, default | `handlers/menu.py`, `storage.py` | `tests/test_storage.py` | реализовано |
 | Имя профиля уникально без учёта регистра; лимиты | `storage.py` | `tests/test_storage.py` | реализовано |
 | Не показывать внутренний JSON перед расчётом | `handlers/survey.py` | `tests/test_bot_flow.py` | реализовано |
 | Краткий иерархичный результат | `report.format_telegram_summary` | `tests/test_report.py` | реализовано |
-| PDF не падает при ошибке DB/save | безопасный id `unsaved` в `survey.confirmation` | требуется Telegram integration test | реализовано |
-| Реальный Back с повторным рендером | `_render_current_step`, `NavigationMiddleware` | `tests/test_survey_resilience.py` | реализовано для ключевых экранов; редкие глубинные состояния используют универсальную подсказку |
-| Устойчивость к старым callback | локализованный fallback и per-user FSM lock | `tests/test_survey_resilience.py`, `tests/test_middleware.py` | реализовано; flow revision и удаление старой клавиатуры остаются на следующий этап |
+| PDF не падает при ошибке DB/save | безопасный id `unsaved` в `handlers/result.py` | `tests/test_survey_resilience.py` | реализовано |
+| Повторное получение исходного PDF версии | `handlers/history.py`, `storage.py` | приватный BLOB-артефакт, неизменяемость, menu/integration tests | реализовано |
+| Реальный Back с повторным рендером | `_render_current_step`, `NavigationMiddleware` | `tests/test_survey_resilience.py` | все штатные шаги, включая вложенные редакторы, восстанавливают локализованный вопрос или клавиатуру |
+| Устойчивость к старым callback | локализованный fallback, per-user FSM lock и централизованное снятие использованной inline-клавиатуры | `tests/test_survey_resilience.py`, `tests/test_middleware.py` | реализовано; callback из старого экрана безопасно отклоняется текущим FSM-состоянием |
 | Default-профиль влияет на wizard | профиль загружается при `/new`, значения предлагаются кнопками | `tests/test_menu_flow.py` | реализовано для температуры, воздухообмена и запаса |
-| Пошаговые стены, проёмы и точные мостики без `|` | кнопочные редакторы конструкций, ориентации, утепления, окон/дверей с привязкой к стене и `ψ × L`; выбранные группы и мостики можно переописать или удалить, импорт сохранён отдельно | `tests/test_survey_resilience.py`, `tests/test_opening_editor.py` | реализовано |
+| Пошаговые стены, пол/кровля, проёмы и точные мостики без `|` | кнопочные редакторы конструкций до 10 слоёв, ориентации, окон/дверей с привязкой к стене и `ψ × L`; выбранные группы и мостики можно переописать или удалить, импорт сохранён отдельно | компонентные тесты и полный advanced-сценарий `test_advanced_dialog_uses_stepwise_editors_without_pipe_syntax` в `tests/test_integration_flow.py` | реализовано; сквозной тест сохраняет расчёт и PDF и отдельно проверяет отсутствие `|` во всём текстовом вводе |
 | Графическая схема | отсутствует | — | не реализовано |
 | Геокодинг с ручным fallback | отсутствует | — | не реализовано |
+| Нормативный параметр Б и источник ручного климата | `catalog.py`, `handlers/climate.py`, `services/building_factory.py` | catalog, source-step, resume и provenance tests | встроенные города идут сразу к сценарию; ручной климат RU/UZ хранит источник и явную маркировку |

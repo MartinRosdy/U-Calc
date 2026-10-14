@@ -147,6 +147,14 @@ class OpeningEditorTests(unittest.IsolatedAsyncioTestCase):
         message = FakeMessage()
 
         await opening_editor.opening_action(FakeCallback("oedit:edit:0", message), state)
+        self.assertEqual(
+            [item["name"] for item in state.data["window_groups"]],
+            ["Север", "Юг"],
+        )
+        duplicate = FakeMessage("юг")
+        await opening_editor.opening_name(duplicate, state)
+        self.assertIn("уже", duplicate.answers[-1][0])
+        self.assertEqual(state.state, Survey.opening_editor_name)
         await opening_editor.opening_name(FakeMessage("Север новый"), state)
         await opening_editor.opening_count(FakeMessage("1"), state)
         await opening_editor.opening_dimensions(FakeMessage("1,2x1"), state)
@@ -164,6 +172,56 @@ class OpeningEditorTests(unittest.IsolatedAsyncioTestCase):
         stale = FakeCallback("oedit:edit:9", message)
         await opening_editor.opening_action(stale, state)
         self.assertTrue(stale.answers[-1][1]["show_alert"])
+
+    async def test_opening_editor_rejects_negative_indexes_without_mutation(self) -> None:
+        original = [
+            {
+                "name": "Север",
+                "count": 1,
+                "width_m": 1.0,
+                "height_m": 1.0,
+                "area_m2": 1.0,
+                "u_value": 1.2,
+                "wall_name": None,
+            }
+        ]
+        state = FakeState(
+            {
+                "opening_editor_kind": "window",
+                "window_count": 1,
+                "window_groups": list(original),
+            }
+        )
+        message = FakeMessage()
+
+        for action in ("oedit:edit:-1", "oedit:delete:-1"):
+            callback = FakeCallback(action, message)
+            await opening_editor.opening_action(callback, state)
+            self.assertTrue(callback.answers[-1][1]["show_alert"])
+            self.assertEqual(state.data["window_groups"], original)
+
+    async def test_unassigned_opening_area_error_is_shown_inline(self) -> None:
+        state = FakeState(
+            {
+                "locale": "ru",
+                "opening_editor_kind": "window",
+                "opening_editor_edit_index": None,
+                "window_count": 1,
+                "window_groups": [],
+                "wall_groups": [],
+                "wall_gross_area": 1.0,
+                "opening_editor_name": "Большое окно",
+                "opening_editor_count": 1,
+                "opening_editor_width": 2.0,
+                "opening_editor_height": 1.0,
+            }
+        )
+        message = FakeMessage("1,2")
+        await opening_editor.opening_u_value(message, state)
+
+        self.assertIn("площадь проёмов", message.answers[-1][0])
+        self.assertEqual(state.state, None)
+        self.assertEqual(state.data["window_groups"], [])
 
     async def test_door_editor_checks_capacity_of_selected_wall(self) -> None:
         state = FakeState(

@@ -1,49 +1,46 @@
 # ruff: noqa: F401
 """Telegram application facade.
 
-Conversation handlers live in :mod:`u_calc.handlers.survey`. Re-exports keep
-the established import surface for integrations while this module remains the
-small console entry point.
+Conversation handlers live in feature modules under :mod:`u_calc.handlers`.
+Re-exports keep the established import surface for integrations while this
+module remains the small console entry point.
 """
 
 from .app import main, run
-from .handlers.survey import (
-    Survey,
+from .handlers.airflow import air_changes, heat_recovery
+from .handlers.boundaries import (
     _advance_after_openings,
     _ask_adjacent_mode,
-    _go_back,
-    _send_long_message,
-    air_changes,
-    building_type,
-    calculation_mode,
     ceiling_boundary,
-    climate,
-    confirmation,
-    dimensions,
-    door_count,
-    door_dimensions,
-    door_method,
-    door_type,
     floor_boundary,
     ground_exterior_sides,
     ground_floor_construction,
-    heat_recovery,
-    indoor,
-    insulated,
-    insulation_material,
-    insulation_thickness,
-    object_name,
-    profile_design,
-    router,
-    safety_factor,
-    scenario,
-    start,
     surface_adjacent_mode,
     surface_insulated,
     surface_insulation_material,
     surface_insulation_thickness,
     surface_material,
     surface_thickness,
+)
+from .handlers.climate import climate, profile_design, profile_design_source, scenario
+from .handlers.result import _send_long_message, confirmation, safety_factor
+from .handlers.survey import (
+    Survey,
+    _go_back,
+    building_type,
+    calculation_mode,
+    dimensions,
+    door_count,
+    door_dimensions,
+    door_method,
+    door_type,
+    indoor,
+    insulated,
+    insulation_material,
+    insulation_thickness,
+    object_name,
+    router,
+    start,
     thermal_bridges,
     wall_area,
     wall_material,

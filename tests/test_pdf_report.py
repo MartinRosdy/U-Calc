@@ -2,20 +2,20 @@ import unittest
 
 from u_calc.calculator import calculate_heat_loss
 from u_calc.models import Airflow, Building, Layer, OpaqueSurface
-from u_calc.pdf_report import _localized_line_text, build_pdf_report
-from u_calc.report import format_report
+from u_calc.pdf_report import build_pdf_report
+from u_calc.report import format_report, localize_system_text
 from u_calc.services.calculation_service import CalculationBundle
 
 
 class PdfReportTests(unittest.TestCase):
     def test_pdf_line_labels_are_localized_without_changing_user_names(self) -> None:
         self.assertEqual(
-            _localized_line_text("Механическая вентиляция", "uz"),
+            localize_system_text("Механическая вентиляция", "uz"),
             "Mexanik ventilyatsiya",
         )
-        self.assertEqual(_localized_line_text("Стена: Shimol", "uz"), "Devor: Shimol")
-        self.assertEqual(_localized_line_text("Foydalanuvchi nomi", "uz"), "Foydalanuvchi nomi")
-        self.assertEqual(_localized_line_text("Ограждение", "ru"), "Ограждение")
+        self.assertEqual(localize_system_text("Стена: Shimol", "uz"), "Devor: Shimol")
+        self.assertEqual(localize_system_text("Foydalanuvchi nomi", "uz"), "Foydalanuvchi nomi")
+        self.assertEqual(localize_system_text("Ограждение", "ru"), "Ограждение")
 
     def test_pdf_is_generated_and_contains_multiple_pages(self) -> None:
         building = Building(
@@ -48,8 +48,15 @@ class PdfReportTests(unittest.TestCase):
         self.assertAlmostEqual(sum(line.watts for line in result.lines), result.total_w)
         self.assertNotIn(b"Telegram user", pdf)
 
+        uz_bundle = CalculationBundle(
+            building,
+            result,
+            None,
+            None,
+            format_report(building, result, locale="uz"),
+        )
         uz_pdf = build_pdf_report(
-            bundle,
+            uz_bundle,
             {
                 "object_name": "Sinov uyi",
                 "prepared_by": "Usta",

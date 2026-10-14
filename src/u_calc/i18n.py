@@ -18,7 +18,82 @@ RU: dict[str, str] = {
     "menu.profiles": "⚙️ Профили расчёта",
     "menu.language": "🌐 Язык",
     "menu.help": "ℹ️ Помощь и методика",
+    "menu.privacy": "🔒 Данные и приватность",
     "menu.home": "🏠 В меню",
+    "history.empty": "История пока пуста.",
+    "history.open": "Открыть №{id}: {name}",
+    "history.command_empty": "История пока пуста. Начните расчёт командой /new",
+    "history.command_title": "🗂 Последние расчёты:",
+    "history.command_item": (
+        "• №{id} · {created} · {kind} · {name} v{version} · "
+        "{recommended} кВт с запасом"
+    ),
+    "history.card": (
+        "📄 Расчёт №{id}\nОбъект: {name}\nВерсия: {version}\nТип: {kind}\n"
+        "Нагрузка: {total} кВт\nС запасом: {recommended} кВт\nСоздан: {created}\n"
+        "Автор версии: {author}\n"
+        "Движок: {engine}\nКаталог: {catalog}\nНормы: {norms}"
+    ),
+    "history.author_owner": "владелец расчёта",
+    "history.kind.apartment": "квартира",
+    "history.kind.house": "дом",
+    "history.kind.unknown": "объект",
+    "history.report": "📄 Открыть отчёт",
+    "history.pdf": "📥 Скачать исходный PDF",
+    "history.pdf_unavailable": (
+        "PDF не сохранён для этой версии. Создайте новую версию расчёта, чтобы получить "
+        "неизменяемый PDF-артефакт."
+    ),
+    "history.pdf_caption": "Сохранённый PDF расчёта №{id}, версия {version}",
+    "history.copy": "📋 Создать новую версию",
+    "history.compare": "↔️ Сравнить с предыдущей",
+    "history.delete": "🗑 Удалить расчёт",
+    "history.back": "⬅️ К истории",
+    "history.not_found": "Расчёт не найден в вашей истории.",
+    "history.no_previous": "У этого объекта пока нет предыдущей версии.",
+    "history.same": "Исходные данные версий совпадают.",
+    "history.diff_title": "Изменения относительно версии {version}:",
+    "history.diff_command_title": "Изменённые исходные данные:",
+    "history.compare_usage": "Укажите два номера: /compare 12 15",
+    "history.compare_not_found": "Один из расчётов не найден в вашей истории.",
+    "history.copy_usage": "Укажите номер: /copy 12",
+    "history.report_usage": "Укажите номер: /report 12",
+    "history.report_title": "Расчёт №{id}",
+    "history.delete_all_prompt": (
+        "Удалить все ваши сохранённые расчёты? Это действие нельзя отменить."
+    ),
+    "history.delete_all_confirm": "Да, удалить",
+    "history.delete_all_done": "Удалено расчётов: {count}.",
+    "history.field.object_name": "Объект",
+    "history.field.prepared_by": "Автор",
+    "history.field.building_type": "Тип объекта",
+    "history.field.climate_key": "Климат",
+    "history.field.scenario": "Климатический сценарий",
+    "history.field.confirmed_design_c": "Параметр Б, °C",
+    "history.field.indoor": "Внутренняя температура, °C",
+    "history.field.length": "Длина, м",
+    "history.field.width": "Ширина, м",
+    "history.field.height": "Высота, м",
+    "history.field.wall_gross_area": "Площадь стен, м²",
+    "history.field.wall_groups": "Конструкции стен",
+    "history.field.window_area": "Площадь окон, м²",
+    "history.field.window_groups": "Группы окон",
+    "history.field.door_area": "Площадь дверей, м²",
+    "history.field.door_groups": "Группы дверей",
+    "history.field.floor_boundary": "Нижняя граница",
+    "history.field.ceiling_boundary": "Верхняя граница",
+    "history.field.air_changes": "Общая кратность воздуха, 1/ч",
+    "history.field.mechanical_ventilation_m3_h": "Механическая вентиляция, м³/ч",
+    "history.field.natural_ventilation_m3_h": "Естественная вентиляция, м³/ч",
+    "history.field.infiltration_m3_h": "Инфильтрация, м³/ч",
+    "history.field.linear_thermal_bridges": "Линейные мостики холода",
+    "history.field.safety_factor": "Коэффициент запаса",
+    "history.field.other": "{name}",
+    "history.value.collection": "изменённый блок ({count} элементов)",
+    "history.copy_ready": "Исходные данные скопированы. Проверьте карточку перед расчётом.",
+    "history.delete_confirm": "Удалить расчёт №{id} «{name}»? Действие необратимо.",
+    "history.deleted": "Расчёт удалён.",
+    "history.delete_cancelled": "Удаление отменено.",
     "language.title": "Выберите язык интерфейса:",
     "language.saved": "Язык сохранён.",
     "profiles.title": "⚙️ Профили расчёта",
@@ -64,12 +139,29 @@ RU: dict[str, str] = {
     "common.internal": "Внутренняя ошибка",
     "common.unhandled": (
         "Не удалось обработать этот шаг. Данные расчёта могли сохраниться не полностью. "
-        "Попробуйте ещё раз или начните заново командой /new."
+        "Попробуйте ещё раз или начните заново командой /new. "
+        "Если ошибка повторяется, сообщите поддержке код {incident_id}."
     ),
     "common.stale": "Эта кнопка устарела. Откройте актуальный экран через /menu или /resume.",
+    "privacy.delete_prompt": (
+        "Удалить все ваши данные U-Calc из SQLite: расчёты и PDF, черновик, профили, "
+        "настройки и журнал действий? Действие необратимо. После удаления можно начать "
+        "заново командой /start."
+    ),
+    "privacy.delete_confirm": "⚠️ Да, удалить все мои данные",
+    "privacy.delete_cancelled": "Удаление данных отменено.",
+    "privacy.deleted": (
+        "Все ваши данные удалены: расчётов — {calculations}, профилей — {profiles}, "
+        "черновиков — {drafts}. Для нового начала используйте /start."
+    ),
     "safety.access_denied": "Доступ к U-Calc ограничен владельцем бота.",
+    "safety.private_chat_only": (
+        "U-Calc работает только в личном чате. Откройте диалог с ботом, чтобы данные "
+        "объекта и PDF не попали в общий чат."
+    ),
     "safety.message_too_long": "Сообщение слишком длинное. Максимум {limit} символов.",
     "safety.rate_limited": "Слишком много действий. Подождите минуту и продолжите.",
+    "safety.system_busy": "U-Calc временно занят. Подождите минуту и повторите действие.",
     "safety.calculation_rate_limited": (
         "Слишком много расчётов. Подождите минуту перед повторным запуском."
     ),
@@ -107,17 +199,25 @@ RU: dict[str, str] = {
     "climate.samarkand": "Самарканд",
     "climate.nukus": "Нукус",
     "survey.outdoor_manual": ("Введите расчётную наружную температуру зимой, °C (например -18):"),
+    "survey.climate.source": (
+        "Укажите источник введённой расчётной температуры: документ, таблицу, "
+        "метеостанцию или паспорт проекта (до 300 символов). Если источник неизвестен, "
+        "отправьте «-»:"
+    ),
     "survey.city_name": "Название города или населённого пункта:",
     "survey.custom.cold_mean": "Средняя температура самого холодного месяца, °C:",
     "survey.custom.design": "Расчётная зимняя температура для отопления, °C:",
     "survey.custom.extreme": "Абсолютный наблюдавшийся минимум, °C:",
     "survey.custom.hot_mean": "Средняя температура самого жаркого месяца, °C:",
     "survey.custom.hot_max": "Абсолютный наблюдавшийся максимум, °C:",
+    "survey.custom.source": (
+        "Укажите источник климатического профиля (до 300 символов). "
+        "Если источник неизвестен, отправьте «-»:"
+    ),
     "survey.profile_design": (
-        "Для {city} среднемесячные и экстремальные температуры подтверждены "
-        "таблицей 1 ШНҚ 2.01.01-22, но расчётный мороз требует подтверждения.\n\n"
-        "Введите температуру параметра Б, °C — наиболее холодной пятидневки "
-        "обеспеченностью 0,92:"
+        "Это старый черновик с ручной поправкой клима {city}. "
+        "Введите температуру параметра Б, °C; новые расчёты используют нормативное "
+        "значение таблицы 4 ШНҚ 2.01.01-22 автоматически:"
     ),
     "survey.scenario.question": (
         "Шаг 2/9 — климат. {city}: выберите режим расчёта.\n"
@@ -163,6 +263,35 @@ RU: dict[str, str] = {
     "survey.opening.dimensions_method": "Размером одного элемента",
     "survey.opening.editor_method": "Разные группы и U — пошагово",
     "survey.opening.import_method": "Экспертный импорт строками |",
+    "expert.wall_prompt": (
+        "Каждая конструкция — с новой строки:\n"
+        "Название | площадь или ширина×высота | материал | толщина см | "
+        "утеплитель | толщина см\n\n"
+        "Пример:\nСевер | 10x3 | кирпич | 25 | минвата | 5\n"
+        "Торец | 18 | газоблок | 30 | нет | 0\n\n"
+        "Материалы: кирпич, пустотелый кирпич, газоблок, бетон, дерево. "
+        "Утеплители: минвата, пенопласт, XPS, ППУ. Для паспортного материала "
+        "введите вместо названия λ=0,12. Площади указываются до вычета окон."
+    ),
+    "expert.window_prompt": (
+        "Каждая группа окон — с новой строки:\n"
+        "Название | количество | ширина×высота, м | паспортный U | "
+        "название стены (необязательно)\n\n"
+        "Пример:\nПВХ север | 3 | 1,4x1,5 | 1,1 | Север\n"
+        "Окно кухни | 1 | 1,2x1,4 | 1,6 | Торец\n\n"
+        "Название стены должно совпадать со списком стен. Если его не указать, "
+        "площадь распределится пропорционально."
+    ),
+    "expert.door_prompt": (
+        "Каждая группа дверей — с новой строки:\n"
+        "Название | количество | ширина×высота, м | паспортный U | "
+        "стена (необязательно)\n\n"
+        "Пример:\nВходная | 1 | 0,9x2,1 | 1,4 | Север"
+    ),
+    "expert.bridge_prompt": (
+        "Каждый мостик — с новой строки:\nНазвание | длина, м | ψ, Вт/(м·К)\n\n"
+        "Пример:\nБалконная плита | 4,5 | 0,35\nПеремычки | 8 | 0,12"
+    ),
     "survey.window.method": "Как задать окна?",
     "survey.window.area": "Суммарная площадь всех наружных окон, м²:",
     "survey.window.dimensions": (
@@ -279,6 +408,15 @@ RU: dict[str, str] = {
     "survey.surface.material": "Основной материал {surface}:",
     "survey.surface.insulated": "Есть утепление?",
     "survey.surface.insulation": "Материал утепления:",
+    "survey.surface.layers.summary": "Слоёв в конструкции: {count}. Что дальше?",
+    "survey.surface.layers.add": "Добавить слой",
+    "survey.surface.layers.finish": "Завершить конструкцию",
+    "survey.surface.layers.material": "Материал следующего слоя:",
+    "survey.surface.layers.passport": "Паспортная λ",
+    "survey.surface.layers.lambda": "Введите паспортную λ слоя, Вт/(м·К):",
+    "survey.surface.layers.thickness": "Толщина слоя «{material}», см:",
+    "survey.surface.layers.custom_thickness": "Введите толщину слоя, см:",
+    "survey.surface.layers.limit": "Допустимо не более 10 слоёв.",
     "survey.air.quick": (
         "Шаг 7/9 — вентиляция. Оцените воздухообмен: герметичное здание — 0,3; "
         "обычное — 0,5; старое/продуваемое — 0,8–1,0. В быстром режиме это "
@@ -293,8 +431,56 @@ RU: dict[str, str] = {
     "survey.air.mechanical": (
         "Расход организованной механической вентиляции, {unit}. Если её нет — 0:"
     ),
-    "survey.air.natural": "Расход естественной организованной вентиляции, {unit}. Нет — 0:",
-    "survey.air.infiltration": "Расчётная инфильтрация через неплотности, {unit}. Нет — 0:",
+    "survey.air.natural": (
+        "Расход естественного организованного притока, {unit}. Не дублируйте здесь "
+        "воздух, который затем зададите как инфильтрацию. Нет — 0:"
+    ),
+    "survey.air.infiltration": (
+        "Расчётная инфильтрация через неплотности, {unit}. Введите расход/кратность "
+        "числом либо выберите нормативный метод:"
+    ),
+    "survey.air.infiltration.residential": "ШНҚ: 3 м³/ч на м² жилой площади",
+    "survey.air.infiltration.envelope": "ШНҚ: воздухопроницаемость и давление (формула 3)",
+    "survey.air.infiltration.none": "Инфильтрация отсутствует",
+    "survey.air.infiltration.pressure_method": (
+        "Как задать расчётные перепады давления для формулы 3?"
+    ),
+    "survey.air.infiltration.pressure_direct": "Ввести готовые Δp",
+    "survey.air.infiltration.pressure_formula4": "Рассчитать по формуле 4",
+    "survey.air.infiltration.pressure_globals": (
+        "Формула 4 приложения 8: введите общие исходные данные одной строкой:\n\n"
+        "H | ρн | v | cₑ,n | cₑ,p | k₁ | pᵢnt\n\n"
+        "Единицы: м | кг/м³ | м/с | — | — | — | Па. Температуры бот берёт из текущего "
+        "расчёта. Коэффициенты cₑ и k₁ берутся по ШНҚ 2.01.07-21, pᵢnt — из баланса "
+        "притока/вытяжки.\nПример: 12 | 1,3 | 5 | 0,8 | -0,6 | 1 | 0"
+    ),
+    "survey.air.infiltration.pressure_groups": (
+        "Введите группы ограждений, каждую с новой строки:\n\n"
+        "hi | h1 | A1 | Ru | A2 | Gn | A3 | l\n\n"
+        "hi — высота верха текущего проёма/центра стыка, h1 — соответствующая высота "
+        "первого этажа; далее параметры формулы 3. Единицы: м | м | м² | "
+        "м²·ч·Па/кг | м² | кг/(м²·ч) | м² | м.\n"
+        "Пример: 8 | 2,5 | 20 | 0,5 | 100 | 0,2 | 0 | 0"
+    ),
+    "survey.air.infiltration.living_area": (
+        "Введите площадь жилых комнат, м² (не общую площадь). По формуле 2 приложения 8 "
+        "будет принято 3 м³/ч на каждый м². Полный расчёт воздухопроницаемости может "
+        "дать большее значение:"
+    ),
+    "survey.air.infiltration.envelope_input": (
+        "Экспертный расчёт по формуле 3 приложения 8 ШНҚ 2.04.05-22. Введите одну "
+        "или несколько строк (отдельная строка для каждой группы с одинаковым перепадом):\n\n"
+        "Δpi | Δp1 | A1 | Ru | A2 | Gn | A3 | l\n\n"
+        "Единицы: Па | Па | м² | м²·ч·Па/кг | м² | кг/(м²·ч) | м² | м. "
+        "Неиспользуемые A1/A2/A3/l укажите как 0. Перепады давления должны быть "
+        "предварительно определены по формуле 4 с учётом высоты, ветра и внутреннего давления.\n"
+        "Пример: 12 | 10 | 20 | 0,5 | 100 | 0,2 | 0 | 0"
+    ),
+    "survey.air.infiltration.envelope_living_area": (
+        "Если объект жилой, введите площадь жилых комнат, м²: бот сравнит формулу 3 "
+        "с формулой 2 (3 м³/ч на м²) и примет больший результат. Для нежилого объекта "
+        "или если сравнение не требуется — 0:"
+    ),
     "survey.air.recovery": "Есть рекуперация механической вентиляции?",
     "survey.air.recovery_efficiency": "Паспортный КПД рекуператора, %. Например 70:",
     "survey.air.error.invalid": "Некорректный воздухообмен",
@@ -330,6 +516,7 @@ RU: dict[str, str] = {
     "bridge.editor.finish": "✅ Готово",
     "bridge.editor.retry": "⚠️ {message}. Попробуйте ещё раз.",
     "bridge.editor.error.name": "Название должно содержать от 1 до 60 символов",
+    "bridge.editor.error.duplicate": "Такое название мостика уже используется",
     "bridge.editor.error.length": "Длина должна быть от 0,01 до 10 000 м",
     "bridge.editor.error.psi": "ψ должен быть от 0 до 5 Вт/(м·К)",
     "bridge.editor.error.limit": "Можно задать не более 30 мостиков холода",
@@ -338,6 +525,9 @@ RU: dict[str, str] = {
     "bridge.editor.error.required": "Добавьте хотя бы один мостик",
     "bridge.editor.error.action": "Неизвестное действие",
     "bridge.editor.error.stale": "Мостик больше недоступен",
+    "bridge.editor.error.corrupt": (
+        "Сохранённые данные мостиков повреждены. Редактор безопасно перезапущен"
+    ),
     "survey.safety.question": "Шаг 9/9 — эксплуатационный запас после всех рассчитанных потерь:",
     "survey.safety.normal": "10% — обычно",
     "survey.safety.from_profile": "⭐ Из профиля: {value}%",
@@ -475,9 +665,15 @@ RU: dict[str, str] = {
     ),
     "pdf.formulas": "Формулы и построчный расчёт",
     "pdf.formulas_text": (
-        "Ограждения: Q = U x A x ΔT x (1 + β) x n. Воздушные потери: "
+        "Ограждения: R = Rsi + Σ(d/λ) + Rse; U = 1/R; "
+        "Q = U x A x ΔT x (1 + β) x n. ISO 6946:2017, таблица 7: "
+        "Rsi = 0,13 для стены, 0,17 для потока вниз, 0,10 для потока вверх; "
+        "Rse = 0,04 м²·К/Вт для наружного воздуха. Воздушные потери: "
         "Q = 0,33 x L x ΔT; рекуперация применяется только к механическому потоку. "
-        "Линейные мостики: Q = ψ x L x ΔT."
+        "Инфильтрация по ШНҚ: формулы 1–3 приложения 8; перепад давления — формула 4, "
+        "удельный вес воздуха — формула 5. Линейные мостики: Q = ψ x L x ΔT. "
+        "Процентный fallback — оценка от суммы потерь через непрозрачные ограждения, "
+        "проёмы и пол по грунту до мостиков; это не нормативное ψ."
     ),
     "pdf.element": "Элемент",
     "pdf.type": "Тип",
@@ -501,6 +697,18 @@ RU: dict[str, str] = {
         "Результат не заменяет подписанный инженерный проект. ГВС и годовое потребление "
         "энергии в расчёт не входят."
     ),
+    "help.version": (
+        "Версия продукта: {engine}\nКаталог: {catalog}\nНормативная база: {norms}"
+    ),
+    "help.commands": (
+        "Команды:\n/new — новый расчёт\n/history — последние расчёты\n"
+        "/report N — открыть сохранённый расчёт №N\n"
+        "/delete_history — удалить свою историю\n/resume — продолжить черновик\n"
+        "/discard_draft — удалить черновик\n/copy N — копировать расчёт\n"
+        "/compare N M — сравнить две версии\n"
+        "/delete_my_data — удалить все свои данные U-Calc\n"
+        "/back — предыдущий шаг\n/cancel — отменить\n/help — справка"
+    ),
 }
 
 UZ: dict[str, str] = {
@@ -512,7 +720,84 @@ UZ: dict[str, str] = {
     "menu.profiles": "⚙️ Hisob profillari",
     "menu.language": "🌐 Til",
     "menu.help": "ℹ️ Yordam va usul",
+    "menu.privacy": "🔒 Ma’lumotlar va maxfiylik",
     "menu.home": "🏠 Menyuga",
+    "history.empty": "Hisoblar tarixi bo‘sh.",
+    "history.open": "№{id} ni ochish: {name}",
+    "history.command_empty": "Hisoblar tarixi bo‘sh. /new buyrug‘i bilan hisobni boshlang",
+    "history.command_title": "🗂 So‘nggi hisoblar:",
+    "history.command_item": (
+        "• №{id} · {created} · {kind} · {name} v{version} · "
+        "zaxira bilan {recommended} kVt"
+    ),
+    "history.card": (
+        "📄 Hisob №{id}\nObyekt: {name}\nVersiya: {version}\nTuri: {kind}\n"
+        "Yuklama: {total} kW\nZaxira bilan: {recommended} kW\nYaratilgan: {created}\n"
+        "Versiya muallifi: {author}\n"
+        "Hisoblash yadrosi: {engine}\nKatalog: {catalog}\nMe’yorlar: {norms}"
+    ),
+    "history.author_owner": "hisob egasi",
+    "history.kind.apartment": "kvartira",
+    "history.kind.house": "uy",
+    "history.kind.unknown": "obyekt",
+    "history.report": "📄 Hisobotni ochish",
+    "history.pdf": "📥 Asl PDF-ni yuklab olish",
+    "history.pdf_unavailable": (
+        "Bu versiya uchun PDF saqlanmagan. O‘zgarmas PDF artefaktini olish uchun "
+        "hisobning yangi versiyasini yarating."
+    ),
+    "history.pdf_caption": "№{id} hisobning saqlangan PDF fayli, {version}-versiya",
+    "history.copy": "📋 Yangi versiya yaratish",
+    "history.compare": "↔️ Oldingi versiya bilan solishtirish",
+    "history.delete": "🗑 Hisobni o‘chirish",
+    "history.back": "⬅️ Tarixga",
+    "history.not_found": "Hisob sizning tarixingizda topilmadi.",
+    "history.no_previous": "Bu obyektning oldingi versiyasi hali yo‘q.",
+    "history.same": "Versiyalarning boshlang‘ich ma’lumotlari bir xil.",
+    "history.diff_title": "{version}-versiyaga nisbatan o‘zgarishlar:",
+    "history.diff_command_title": "O‘zgargan boshlang‘ich ma’lumotlar:",
+    "history.compare_usage": "Ikki raqamni kiriting: /compare 12 15",
+    "history.compare_not_found": "Hisoblardan biri tarixingizda topilmadi.",
+    "history.copy_usage": "Raqamni kiriting: /copy 12",
+    "history.report_usage": "Raqamni kiriting: /report 12",
+    "history.report_title": "№{id} hisob",
+    "history.delete_all_prompt": (
+        "Barcha saqlangan hisoblaringiz o‘chirilsinmi? Bu amalni bekor qilib bo‘lmaydi."
+    ),
+    "history.delete_all_confirm": "Ha, o‘chirish",
+    "history.delete_all_done": "O‘chirilgan hisoblar: {count}.",
+    "history.field.object_name": "Obyekt",
+    "history.field.prepared_by": "Muallif",
+    "history.field.building_type": "Obyekt turi",
+    "history.field.climate_key": "Iqlim",
+    "history.field.scenario": "Iqlim ssenariysi",
+    "history.field.confirmed_design_c": "B parametri, °C",
+    "history.field.indoor": "Ichki harorat, °C",
+    "history.field.length": "Uzunlik, m",
+    "history.field.width": "Kenglik, m",
+    "history.field.height": "Balandlik, m",
+    "history.field.wall_gross_area": "Devorlar maydoni, m²",
+    "history.field.wall_groups": "Devor konstruksiyalari",
+    "history.field.window_area": "Derazalar maydoni, m²",
+    "history.field.window_groups": "Deraza guruhlari",
+    "history.field.door_area": "Eshiklar maydoni, m²",
+    "history.field.door_groups": "Eshik guruhlari",
+    "history.field.floor_boundary": "Pastki chegara",
+    "history.field.ceiling_boundary": "Yuqori chegara",
+    "history.field.air_changes": "Umumiy havo almashinuvi, 1/soat",
+    "history.field.mechanical_ventilation_m3_h": "Mexanik ventilyatsiya, m³/soat",
+    "history.field.natural_ventilation_m3_h": "Tabiiy ventilyatsiya, m³/soat",
+    "history.field.infiltration_m3_h": "Infiltratsiya, m³/soat",
+    "history.field.linear_thermal_bridges": "Chiziqli sovuq ko‘priklari",
+    "history.field.safety_factor": "Zaxira koeffitsiyenti",
+    "history.field.other": "{name}",
+    "history.value.collection": "o‘zgargan blok ({count} element)",
+    "history.copy_ready": (
+        "Boshlang‘ich ma’lumotlar nusxalandi. Hisoblashdan oldin kartani tekshiring."
+    ),
+    "history.delete_confirm": "№{id} «{name}» hisobini o‘chirish? Bu amalni bekor qilib bo‘lmaydi.",
+    "history.deleted": "Hisob o‘chirildi.",
+    "history.delete_cancelled": "O‘chirish bekor qilindi.",
     "language.title": "Interfeys tilini tanlang:",
     "language.saved": "Til saqlandi.",
     "profiles.title": "⚙️ Hisob profillari",
@@ -558,12 +843,29 @@ UZ: dict[str, str] = {
     "common.internal": "Ichki xato",
     "common.unhandled": (
         "Bu bosqichni qayta ishlab bo‘lmadi. Hisob ma’lumotlari to‘liq saqlanmagan "
-        "bo‘lishi mumkin. Qayta urinib ko‘ring yoki /new orqali yangidan boshlang."
+        "bo‘lishi mumkin. Qayta urinib ko‘ring yoki /new orqali yangidan boshlang. "
+        "Xato takrorlansa, qo‘llab-quvvatlash xizmatiga {incident_id} kodini yuboring."
     ),
     "common.stale": "Bu tugma eskirgan. Joriy oynani /menu yoki /resume orqali oching.",
+    "privacy.delete_prompt": (
+        "U-Calc SQLite bazasidagi barcha ma’lumotlaringizni: hisoblar va PDF, qoralama, "
+        "profillar, sozlamalar va amallar jurnalini o‘chirilsinmi? Amalni qaytarib bo‘lmaydi. "
+        "Keyin /start orqali yangidan boshlash mumkin."
+    ),
+    "privacy.delete_confirm": "⚠️ Ha, barcha ma’lumotlarimni o‘chirish",
+    "privacy.delete_cancelled": "Ma’lumotlarni o‘chirish bekor qilindi.",
+    "privacy.deleted": (
+        "Barcha ma’lumotlaringiz o‘chirildi: hisoblar — {calculations}, profillar — "
+        "{profiles}, qoralamalar — {drafts}. Yangidan boshlash uchun /start dan foydalaning."
+    ),
     "safety.access_denied": "U-Calc’dan foydalanish bot egasi tomonidan cheklangan.",
+    "safety.private_chat_only": (
+        "U-Calc faqat shaxsiy chatda ishlaydi. Obyekt ma’lumotlari va PDF umumiy chatga "
+        "tushmasligi uchun bot bilan alohida suhbatni oching."
+    ),
     "safety.message_too_long": "Xabar juda uzun. Ko‘pi bilan {limit} ta belgi mumkin.",
     "safety.rate_limited": "Juda ko‘p amal bajarildi. Bir daqiqa kutib davom eting.",
+    "safety.system_busy": "U-Calc vaqtincha band. Bir daqiqa kutib, amalni takrorlang.",
     "safety.calculation_rate_limited": (
         "Juda ko‘p hisob ishga tushirildi. Qayta urinishdan oldin bir daqiqa kuting."
     ),
@@ -601,17 +903,24 @@ UZ: dict[str, str] = {
     "climate.samarkand": "Samarqand",
     "climate.nukus": "Nukus",
     "survey.outdoor_manual": ("Qishki hisobiy tashqi haroratni kiriting, °C (masalan -18):"),
+    "survey.climate.source": (
+        "Kiritilgan hisobiy harorat manbasini ko‘rsating: hujjat, jadval, meteostansiya "
+        "yoki loyiha pasporti (300 belgigacha). Manba noma’lum bo‘lsa, «-» yuboring:"
+    ),
     "survey.city_name": "Shahar yoki aholi punkti nomi:",
     "survey.custom.cold_mean": "Eng sovuq oyning o‘rtacha harorati, °C:",
     "survey.custom.design": "Isitish uchun qishki hisobiy harorat, °C:",
     "survey.custom.extreme": "Kuzatilgan mutlaq minimum, °C:",
     "survey.custom.hot_mean": "Eng issiq oyning o‘rtacha harorati, °C:",
     "survey.custom.hot_max": "Kuzatilgan mutlaq maksimum, °C:",
+    "survey.custom.source": (
+        "Iqlim profili manbasini kiriting (300 belgigacha). "
+        "Manba noma’lum bo‘lsa, «-» yuboring:"
+    ),
     "survey.profile_design": (
-        "{city} uchun oylik o‘rtacha va ekstremal haroratlar ШНҚ 2.01.01-22 "
-        "1-jadvali bilan tasdiqlangan, ammo hisobiy sovuq qiymati tasdiqlanishi kerak.\n\n"
-        "B parametr haroratini kiriting, °C — 0,92 ta’minlanganlikdagi eng sovuq "
-        "besh kunlik:"
+        "Bu {city} iqlimiga qo‘lda tuzatish kiritilgan eski qoralama. B parametr "
+        "haroratini kiriting, °C; yangi hisoblar ШНҚ 2.01.01-22 4-jadvalidagi "
+        "me’yoriy qiymatni avtomatik ishlatadi:"
     ),
     "survey.scenario.question": (
         "2/9-qadam — iqlim. {city}: hisob rejimini tanlang.\n"
@@ -667,6 +976,35 @@ UZ: dict[str, str] = {
     "survey.opening.dimensions_method": "Bitta element o‘lchami bilan",
     "survey.opening.editor_method": "Turli guruhlar va U — bosqichma-bosqich",
     "survey.opening.import_method": "Satrlar orqali ekspert importi |",
+    "expert.wall_prompt": (
+        "Har bir konstruksiyani yangi satrdan kiriting:\n"
+        "Nomi | maydon yoki eni×balandligi | material | qalinlik, sm | "
+        "izolyatsiya | qalinlik, sm\n\n"
+        "Misol:\nShimol | 10x3 | g‘isht | 25 | mineral paxta | 5\n"
+        "Yon devor | 18 | gazoblok | 30 | yo‘q | 0\n\n"
+        "Materiallar: g‘isht, g‘ovak g‘isht, gazoblok, beton, yog‘och. "
+        "Izolyatsiyalar: mineral paxta, penoplast, XPS, PPU. Pasport materialida "
+        "nom o‘rniga λ=0,12 kiriting. Maydonlar derazalarni ayirmasdan ko‘rsatiladi."
+    ),
+    "expert.window_prompt": (
+        "Har bir deraza guruhini yangi satrdan kiriting:\n"
+        "Nomi | soni | eni×balandligi, m | pasportdagi U | "
+        "devor nomi (ixtiyoriy)\n\n"
+        "Misol:\nShimoliy PVX | 3 | 1,4x1,5 | 1,1 | Shimol\n"
+        "Oshxona derazasi | 1 | 1,2x1,4 | 1,6 | Yon devor\n\n"
+        "Devor nomi devorlar ro‘yxatiga aynan mos bo‘lishi kerak. Ko‘rsatilmasa, "
+        "maydon mutanosib taqsimlanadi."
+    ),
+    "expert.door_prompt": (
+        "Har bir eshik guruhini yangi satrdan kiriting:\n"
+        "Nomi | soni | eni×balandligi, m | pasportdagi U | devor (ixtiyoriy)\n\n"
+        "Misol:\nKirish eshigi | 1 | 0,9x2,1 | 1,4 | Shimol"
+    ),
+    "expert.bridge_prompt": (
+        "Har bir issiqlik ko‘prigini yangi satrdan kiriting:\n"
+        "Nomi | uzunligi, m | ψ, Vt/(m·K)\n\n"
+        "Misol:\nBalkon plitasi | 4,5 | 0,35\nTo‘sinlar | 8 | 0,12"
+    ),
     "survey.window.method": "Derazalarni qanday kiritamiz?",
     "survey.window.area": "Barcha tashqi derazalarning umumiy maydoni, m²:",
     "survey.window.dimensions": (
@@ -785,6 +1123,15 @@ UZ: dict[str, str] = {
     "survey.surface.material": "{surface} asosiy materiali:",
     "survey.surface.insulated": "Issiqlik izolyatsiyasi bormi?",
     "survey.surface.insulation": "Izolyatsiya materiali:",
+    "survey.surface.layers.summary": "Konstruksiyada {count} ta qatlam bor. Keyingi amal?",
+    "survey.surface.layers.add": "Qatlam qo‘shish",
+    "survey.surface.layers.finish": "Konstruksiyani yakunlash",
+    "survey.surface.layers.material": "Keyingi qatlam materiali:",
+    "survey.surface.layers.passport": "Pasportdagi λ",
+    "survey.surface.layers.lambda": "Qatlamning pasportdagi λ qiymatini kiriting, Vt/(m·K):",
+    "survey.surface.layers.thickness": "«{material}» qatlam qalinligi, sm:",
+    "survey.surface.layers.custom_thickness": "Qatlam qalinligini kiriting, sm:",
+    "survey.surface.layers.limit": "Ko‘pi bilan 10 ta qatlam kiritish mumkin.",
     "survey.air.quick": (
         "7/9-qadam — ventilyatsiya. Havo almashinuvini baholang: germetik bino — 0,3; "
         "odatdagi — 0,5; eski yoki yelvizakli — 0,8–1,0. Tezkor rejimda bu yagona, "
@@ -802,9 +1149,55 @@ UZ: dict[str, str] = {
         "Tashkillashtirilgan mexanik ventilyatsiya sarfi, {unit}. Bo‘lmasa — 0:"
     ),
     "survey.air.natural": (
-        "Tashkillashtirilgan tabiiy ventilyatsiya sarfi, {unit}. Bo‘lmasa — 0:"
+        "Tashkillashtirilgan tabiiy havo kirishi, {unit}. Keyin infiltratsiya sifatida "
+        "kiritiladigan havoni bu yerda takrorlamang. Bo‘lmasa — 0:"
     ),
-    "survey.air.infiltration": "Tirqishlar orqali hisobiy infiltratsiya, {unit}. Bo‘lmasa — 0:",
+    "survey.air.infiltration": (
+        "Tirqishlar orqali hisobiy infiltratsiya, {unit}. Sarf/karralilikni son bilan "
+        "kiriting yoki me’yoriy usulni tanlang:"
+    ),
+    "survey.air.infiltration.residential": "ШНҚ: yashash maydonining har m² iga 3 m³/soat",
+    "survey.air.infiltration.envelope": "ШНҚ: havo o‘tkazuvchanligi va bosim (3-formula)",
+    "survey.air.infiltration.none": "Infiltratsiya yo‘q",
+    "survey.air.infiltration.pressure_method": (
+        "3-formulasi uchun hisobiy bosim farqlarini qanday kiritamiz?"
+    ),
+    "survey.air.infiltration.pressure_direct": "Tayyor Δp ni kiritish",
+    "survey.air.infiltration.pressure_formula4": "4-formula bo‘yicha hisoblash",
+    "survey.air.infiltration.pressure_globals": (
+        "8-ilovaning 4-formulasi: umumiy ma’lumotlarni bitta qatorda kiriting:\n\n"
+        "H | ρₑ | v | cₑ,n | cₑ,p | k₁ | pᵢnt\n\n"
+        "Birliklar: m | kg/m³ | m/s | — | — | — | Pa. Haroratlarni bot joriy "
+        "hisobdan oladi. cₑ va k₁ koeffitsiyentlari ШНҚ 2.01.07-21 dan, pᵢnt esa "
+        "kirish/chiqish balansidan olinadi.\nMisol: 12 | 1,3 | 5 | 0,8 | -0,6 | 1 | 0"
+    ),
+    "survey.air.infiltration.pressure_groups": (
+        "To‘siq guruhlarini har birini yangi qatorda kiriting:\n\n"
+        "hi | h1 | A1 | Ru | A2 | Gn | A3 | l\n\n"
+        "hi — joriy ochilma yuqorisining/chok markazining balandligi, h1 — birinchi qavatdagi "
+        "mos balandlik; keyin 3-formula parametrlari. Birliklar: m | m | m² | "
+        "m²·soat·Pa/kg | m² | kg/(m²·soat) | m² | m.\n"
+        "Misol: 8 | 2,5 | 20 | 0,5 | 100 | 0,2 | 0 | 0"
+    ),
+    "survey.air.infiltration.living_area": (
+        "Yashash xonalari maydonini kiriting, m² (umumiy maydon emas). 8-ilovaning "
+        "2-formulasi bo‘yicha har m² uchun 3 m³/soat olinadi. Havo o‘tkazuvchanlikning "
+        "to‘liq hisobi kattaroq qiymat berishi mumkin:"
+    ),
+    "survey.air.infiltration.envelope_input": (
+        "ШНҚ 2.04.05-22 8-ilovasining 3-formulasi bo‘yicha ekspert hisobi. Bir xil "
+        "bosim farqiga ega har bir guruhni alohida qatorda kiriting:\n\n"
+        "Δpi | Δp1 | A1 | Ru | A2 | Gn | A3 | l\n\n"
+        "Birliklar: Pa | Pa | m² | m²·soat·Pa/kg | m² | kg/(m²·soat) | m² | m. "
+        "Ishlatilmaydigan A1/A2/A3/l uchun 0 kiriting. Bosim farqlari balandlik, shamol "
+        "va ichki bosimni hisobga olib 4-formula bo‘yicha oldindan aniqlangan bo‘lishi kerak.\n"
+        "Misol: 12 | 10 | 20 | 0,5 | 100 | 0,2 | 0 | 0"
+    ),
+    "survey.air.infiltration.envelope_living_area": (
+        "Obyekt turar joy bo‘lsa, yashash xonalari maydonini m² da kiriting: bot 3-formulani "
+        "2-formula (har m² uchun 3 m³/soat) bilan solishtirib, kattasini oladi. Noturar joy "
+        "yoki solishtirish kerak bo‘lmasa — 0:"
+    ),
     "survey.air.recovery": "Mexanik ventilyatsiyada rekuperatsiya bormi?",
     "survey.air.recovery_efficiency": "Rekuperatorning pasportdagi FIK qiymati, %. Masalan 70:",
     "survey.air.error.invalid": "Havo almashinuvi noto‘g‘ri",
@@ -843,6 +1236,7 @@ UZ: dict[str, str] = {
     "bridge.editor.finish": "✅ Tayyor",
     "bridge.editor.retry": "⚠️ {message}. Qayta urinib ko‘ring.",
     "bridge.editor.error.name": "Nom 1 dan 60 tagacha belgidan iborat bo‘lishi kerak",
+    "bridge.editor.error.duplicate": "Bunday ko‘prik nomi allaqachon ishlatilgan",
     "bridge.editor.error.length": "Uzunlik 0,01 dan 10 000 m gacha bo‘lishi kerak",
     "bridge.editor.error.psi": "ψ 0 dan 5 Vt/(m·K) gacha bo‘lishi kerak",
     "bridge.editor.error.limit": "Ko‘pi bilan 30 ta sovuq ko‘prigi kiritish mumkin",
@@ -851,6 +1245,9 @@ UZ: dict[str, str] = {
     "bridge.editor.error.required": "Kamida bitta sovuq ko‘prigini qo‘shing",
     "bridge.editor.error.action": "Noma’lum amal",
     "bridge.editor.error.stale": "Ko‘prik endi mavjud emas",
+    "bridge.editor.error.corrupt": (
+        "Saqlangan ko‘prik ma’lumotlari buzilgan. Muharrir xavfsiz qayta ishga tushirildi"
+    ),
     "survey.safety.question": (
         "9/9-qadam — barcha hisoblangan yo‘qotishlardan keyingi ekspluatatsion zaxira:"
     ),
@@ -992,9 +1389,16 @@ UZ: dict[str, str] = {
     ),
     "pdf.formulas": "Formulalar va satrma-satr hisob",
     "pdf.formulas_text": (
-        "To‘siqlar: Q = U x A x ΔT x (1 + β) x n. Havo yo‘qotishlari: "
+        "To‘siqlar: R = Rsi + Σ(d/λ) + Rse; U = 1/R; "
+        "Q = U x A x ΔT x (1 + β) x n. ISO 6946:2017, 7-jadval: "
+        "devor uchun Rsi = 0,13, pastga oqim uchun 0,17, yuqoriga oqim uchun 0,10; "
+        "tashqi havo uchun Rse = 0,04 m²·K/Vt. Havo yo‘qotishlari: "
         "Q = 0,33 x L x ΔT; rekuperatsiya faqat mexanik oqimga qo‘llanadi. "
-        "Chiziqli issiqlik ko‘priklari: Q = ψ x L x ΔT."
+        "ШНҚ bo‘yicha infiltratsiya: 8-ilovaning 1–3-formulalari; bosim farqi — "
+        "4-formula, havoning solishtirma og‘irligi — 5-formula. Chiziqli issiqlik "
+        "ko‘priklari: Q = ψ x L x ΔT. Foizli fallback — to‘siqlar, ochiqlar va "
+        "gruntdagi polning ko‘priklargacha bo‘lgan yo‘qotishlari yig‘indisidan baho; "
+        "bu me’yoriy ψ emas."
     ),
     "pdf.element": "Element",
     "pdf.type": "Turi",
@@ -1016,6 +1420,18 @@ UZ: dict[str, str] = {
         "U-Calc to‘siqlar va havo almashinuvi bo‘yicha eng katta isitish yukini baholaydi. "
         "Natija imzolangan muhandislik loyihasini almashtirmaydi. Issiq suv va yillik "
         "energiya sarfi hisobga kirmaydi."
+    ),
+    "help.version": (
+        "Mahsulot versiyasi: {engine}\nKatalog: {catalog}\nMe’yoriy baza: {norms}"
+    ),
+    "help.commands": (
+        "Buyruqlar:\n/new — yangi hisob\n/history — so‘nggi hisoblar\n"
+        "/report N — saqlangan №N hisobni ochish\n"
+        "/delete_history — hisoblar tarixini o‘chirish\n/resume — qoralamani davom ettirish\n"
+        "/discard_draft — qoralamani o‘chirish\n/copy N — hisobni nusxalash\n"
+        "/compare N M — ikki versiyani solishtirish\n"
+        "/delete_my_data — barcha U-Calc ma’lumotlarini o‘chirish\n"
+        "/back — oldingi qadam\n/cancel — bekor qilish\n/help — yordam"
     ),
 }
 

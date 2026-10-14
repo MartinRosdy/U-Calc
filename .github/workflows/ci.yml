@@ -22,11 +22,11 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e '.[dev]'
-      - run: python scripts/sync_requirements.py
-      - run: git diff --exit-code -- requirements.txt
+      - run: python scripts/sync_requirements.py --check
+      - run: python scripts/sync_requirements.py --check-installed
       - run: ruff check src tests scripts main.py
       - run: coverage run -m pytest -q
-      - run: coverage report --fail-under=85
+      - run: coverage report
       - run: python -m compileall -q src tests scripts main.py
       - run: python -m build
       - run: u-calc-demo > /tmp/u-calc-demo.txt
@@ -44,14 +44,41 @@ jobs:
           tags: u-calc:ci
           load: true
       - run: docker run --rm --entrypoint python u-calc:ci -c "import u_calc.pdf_report; print('docker-smoke-ok')"
+      - name: Verify minimal runtime surface
+        run: |
+          docker run --rm u-calc:ci python -c "import importlib.util; from pathlib import Path; assert importlib.util.find_spec('setuptools') is None; assert not Path('/app/src').exists(); assert not Path('/app/pyproject.toml').exists()"
+          docker run --rm u-calc:ci python -m pip check
       - name: Verify non-root runtime and installed command
         run: |
           test "$(docker run --rm u-calc:ci id -u)" = "100"
+          test "$(docker run --rm u-calc:ci id -g)" = "101"
+          docker run --rm u-calc:ci sh -c '! command -v gosu'
+          docker run --rm u-calc:ci sh -c 'grep -q "NoNewPrivs:[[:space:]]*1" /proc/self/status'
           docker run --rm u-calc:ci u-calc-demo > /tmp/u-calc-container-demo.txt
           test -s /tmp/u-calc-container-demo.txt
+          if docker run --rm -e DATABASE_PATH=/etc/u_calc.db u-calc:ci true > /tmp/u-calc-invalid-path.txt 2>&1; then exit 1; fi
+          grep -q "inside /app/data" /tmp/u-calc-invalid-path.txt
+          if grep -q Traceback /tmp/u-calc-invalid-path.txt; then exit 1; fi
+          if docker run --rm --tmpfs /app/data --entrypoint sh -e DATABASE_PATH=/app/data/out/u_calc.db u-calc:ci -c 'ln -s /tmp /app/data/out; u-calc-entrypoint true' > /tmp/u-calc-symlink-path.txt 2>&1; then exit 1; fi
+          grep -q "inside /app/data" /tmp/u-calc-symlink-path.txt
+          docker run --rm --tmpfs /app/data -e BOT_TOKEN=123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghi -e DATABASE_PATH=/app/data/nested/u_calc.db u-calc:ci u-calc-doctor > /tmp/u-calc-nested-doctor.txt
+          grep -q "U-Calc doctor: OK" /tmp/u-calc-nested-doctor.txt
       - name: Verify persistent SQLite volume and current schema
         run: |
           docker volume create u-calc-ci-data
           trap 'docker volume rm u-calc-ci-data' EXIT
           docker run --rm -v u-calc-ci-data:/app/data u-calc:ci python -c "from pathlib import Path; from u_calc.storage import CalculationRepository, SCHEMA_VERSION; r=CalculationRepository(Path('/app/data/u_calc.db')); r.initialize(); assert r.schema_version() == SCHEMA_VERSION"
           docker run --rm -v u-calc-ci-data:/app/data u-calc:ci test -s /app/data/u_calc.db
+          docker run --rm -e BOT_TOKEN=123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghi -v u-calc-ci-data:/app/data u-calc:ci u-calc-doctor > /tmp/u-calc-doctor.txt
+          grep -q "U-Calc doctor: OK" /tmp/u-calc-doctor.txt
+          grep -q "schema v8" /tmp/u-calc-doctor.txt
+          if grep -q "ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghi" /tmp/u-calc-doctor.txt; then exit 1; fi
+          docker run --rm -v u-calc-ci-data:/app/data u-calc:ci sh -c 'test "$(stat -c %a /app/data/u_calc.db)" = 600; test "$(stat -c %a /app/data/u_calc.db.polling.lock)" = 600'
+          docker run --rm -v u-calc-ci-data:/app/data u-calc:ci u-calc-backup --output /app/data/ci-backup.db
+          docker run --rm -v u-calc-ci-data:/app/data u-calc:ci python -c "import sqlite3; c=sqlite3.connect('/app/data/ci-backup.db'); assert c.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'; assert c.execute('PRAGMA user_version').fetchone()[0] == 8"
+          docker run --rm -v u-calc-ci-data:/app/data u-calc:ci u-calc-restore --backup /app/data/ci-backup.db --yes
+          docker run --rm -v u-calc-ci-data:/app/data u-calc:ci python -c "import sqlite3; c=sqlite3.connect('/app/data/u_calc.db'); assert c.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'; assert c.execute('PRAGMA user_version').fetchone()[0] == 8"
+          docker run --rm -v u-calc-ci-data:/app/data u-calc:ci python -c "import sqlite3; c=sqlite3.connect('/app/data/future.db'); c.execute('PRAGMA user_version=9'); c.close()"
+          if docker run --rm -e BOT_TOKEN=123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghi -e DATABASE_PATH=/app/data/future.db -v u-calc-ci-data:/app/data u-calc:ci > /tmp/u-calc-future-schema.txt 2>&1; then exit 1; fi
+          grep -q "schema v9" /tmp/u-calc-future-schema.txt
+          if grep -q Traceback /tmp/u-calc-future-schema.txt; then exit 1; fi

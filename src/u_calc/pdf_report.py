@@ -30,48 +30,11 @@ from reportlab.platypus import (
 from .catalog import CATALOG_VERSION, ENGINE_VERSION
 from .i18n import normalize_locale
 from .i18n import translate as tr
+from .report import localize_system_text
 from .services.calculation_service import CalculationBundle
 from .storage import NORMS_VERSION
 
 rl_config.warnOnMissingFontGlyphs = 0
-
-_UZ_LINE_TEXT = {
-    "Ограждение": "To‘siq",
-    "Проём": "Ochiq",
-    "Пол по грунту": "Gruntdagi pol",
-    "Поправка": "Tuzatish",
-    "Линейный мостик": "Chiziqli issiqlik ko‘prigi",
-    "Вентиляция": "Ventilyatsiya",
-    "Инфильтрация": "Infiltratsiya",
-    "Механическая вентиляция": "Mexanik ventilyatsiya",
-    "Естественная вентиляция": "Tabiiy ventilyatsiya",
-    "Мостики холода (оценка)": "Issiqlik ko‘priklari (baho)",
-    "Пол над соседом": "Pastki qo‘shni ustidagi pol",
-    "Пол": "Pol",
-    "Потолок под соседом": "Yuqori qo‘shni ostidagi shift",
-    "Потолок / кровля": "Shift / tom",
-    "Наружные стены": "Tashqi devorlar",
-    "Окна": "Derazalar",
-    "Наружные двери": "Tashqi eshiklar",
-}
-_UZ_LINE_PREFIXES = {
-    "Стена: ": "Devor: ",
-    "Мостик: ": "Ko‘prik: ",
-    "Пол по грунту — зона ": "Gruntdagi pol — zona ",
-    "Окна (": "Derazalar (",
-}
-
-
-def _localized_line_text(value: str, locale: str) -> str:
-    if locale != "uz":
-        return value
-    if value in _UZ_LINE_TEXT:
-        return _UZ_LINE_TEXT[value]
-    for source, target in _UZ_LINE_PREFIXES.items():
-        if value.startswith(source):
-            return target + value.removeprefix(source)
-    return value
-
 
 def _font_path() -> Path:
     path = Path(__file__).resolve().parent / "assets" / "fonts" / "NotoSans-Regular.ttf"
@@ -115,7 +78,7 @@ def build_pdf_report(
         rightMargin=16 * mm,
         leftMargin=16 * mm,
         topMargin=18 * mm,
-        bottomMargin=18 * mm,
+        bottomMargin=32 * mm,
         title=f"U-Calc - {answers.get('object_name', tr('pdf.unnamed', locale))}",
         author=prepared_by,
     )
@@ -258,8 +221,8 @@ def build_pdf_report(
         rounded_line_watts.append(rounded_watts)
         table_rows.append(
             [
-                Paragraph(escape(_localized_line_text(line.name, locale)), small),
-                Paragraph(escape(_localized_line_text(line.kind, locale)), small),
+                Paragraph(escape(localize_system_text(line.name, locale)), small),
+                Paragraph(escape(localize_system_text(line.kind, locale)), small),
                 "-" if line.area_m2 is None else f"{line.area_m2:.2f}",
                 "-" if line.u_value is None else f"{line.u_value:.3f}",
                 f"{line.delta_t_k:.1f}",

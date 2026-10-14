@@ -126,8 +126,98 @@ class GroundFloorZone:
     resistance_m2k_w: float
 
     def __post_init__(self) -> None:
-        _require_finite_range(self.area_m2, "Площадь зоны, м²", 0.01, 100_000.0)
+        _require_finite_range(
+            self.area_m2,
+            "Площадь зоны, м²",
+            0.0,
+            1_000_000.0,
+            inclusive_minimum=False,
+        )
         _require_finite_range(self.resistance_m2k_w, "Сопротивление зоны, м²·К/Вт", 0.05, 100.0)
+
+
+@dataclass(frozen=True, slots=True)
+class Appendix8PressureInput:
+    """Expert inputs for SHNQ 2.04.05-22 Appendix 8 formula (4)."""
+
+    building_height_m: float
+    opening_height_m: float
+    indoor_temperature_c: float
+    outdoor_temperature_c: float
+    outdoor_air_density_kg_m3: float
+    wind_speed_m_s: float
+    windward_coefficient: float
+    leeward_coefficient: float
+    height_factor: float
+    internal_pressure_pa: float
+
+    def __post_init__(self) -> None:
+        _require_finite_range(self.building_height_m, "Высота здания H, м", 0.01, 1_000.0)
+        _require_finite_range(self.opening_height_m, "Высота проёма hi, м", 0.0, 1_000.0)
+        if self.opening_height_m > self.building_height_m:
+            raise ValueError("Высота проёма hi не может превышать высоту здания H")
+        _require_finite_range(self.indoor_temperature_c, "Температура внутри, °C", -80, 100)
+        _require_finite_range(self.outdoor_temperature_c, "Температура снаружи, °C", -100, 80)
+        _require_finite_range(
+            self.outdoor_air_density_kg_m3, "Плотность наружного воздуха, кг/м³", 0.5, 2.0
+        )
+        _require_finite_range(self.wind_speed_m_s, "Скорость ветра, м/с", 0.0, 100.0)
+        _require_finite_range(self.windward_coefficient, "Коэффициент cₑ,n", -5.0, 5.0)
+        _require_finite_range(self.leeward_coefficient, "Коэффициент cₑ,p", -5.0, 5.0)
+        _require_finite_range(self.height_factor, "Коэффициент k₁", 0.0, 10.0)
+        _require_finite_range(
+            self.internal_pressure_pa, "Внутреннее давление pᵢnt, Па", -5_000, 5_000
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class InfiltrationPath:
+    """One pressure group for SHNQ 2.04.05-22 Appendix 8 formula (3)."""
+
+    pressure_pa: float
+    first_floor_pressure_pa: float
+    opening_area_m2: float = 0.0
+    air_permeability_resistance_m2_h_pa_kg: float = 0.0
+    envelope_area_m2: float = 0.0
+    normative_air_permeability_kg_m2_h: float = 0.0
+    gap_area_m2: float = 0.0
+    panel_joint_length_m: float = 0.0
+    pressure_input: Appendix8PressureInput | None = None
+    first_floor_pressure_input: Appendix8PressureInput | None = None
+
+    def __post_init__(self) -> None:
+        _require_finite_range(self.pressure_pa, "Расчётный перепад давления, Па", 0.01, 5_000.0)
+        _require_finite_range(
+            self.first_floor_pressure_pa,
+            "Перепад давления первого этажа, Па",
+            0.01,
+            5_000.0,
+        )
+        for value, label, maximum in (
+            (self.opening_area_m2, "Площадь световых проёмов A1, м²", 100_000.0),
+            (self.envelope_area_m2, "Площадь прочих ограждений A2, м²", 1_000_000.0),
+            (self.gap_area_m2, "Площадь отверстий A3, м²", 10_000.0),
+            (self.panel_joint_length_m, "Длина стыков l, м", 1_000_000.0),
+        ):
+            _require_finite_range(value, label, 0.0, maximum)
+        _require_finite_range(
+            self.air_permeability_resistance_m2_h_pa_kg,
+            "Сопротивление воздухопроницанию Ru",
+            0.0,
+            1_000_000.0,
+        )
+        _require_finite_range(
+            self.normative_air_permeability_kg_m2_h,
+            "Нормативная воздухопроницаемость Gn",
+            0.0,
+            10_000.0,
+        )
+        if self.opening_area_m2 > 0 and self.air_permeability_resistance_m2_h_pa_kg <= 0:
+            raise ValueError("Для A1 больше нуля требуется положительное Ru")
+        if self.envelope_area_m2 > 0 and self.normative_air_permeability_kg_m2_h <= 0:
+            raise ValueError("Для A2 больше нуля требуется положительное Gn")
+        if (self.pressure_input is None) != (self.first_floor_pressure_input is None):
+            raise ValueError("Для формулы 4 нужны исходные данные обеих высот")
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +229,8 @@ class Airflow:
     infiltration_m3_h: float = 0.0
     heat_recovery_efficiency: float = 0.0
     input_basis: str = "components_m3_h"
+    infiltration_basis: str = "manual_flow"
+    infiltration_paths: tuple[InfiltrationPath, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         for value, label in (
@@ -150,6 +242,18 @@ class Airflow:
         _require_finite_range(self.heat_recovery_efficiency, "КПД рекуперации", 0.0, 0.95)
         if self.input_basis not in {"components_m3_h", "components_ach", "quick_estimate"}:
             raise ValueError("Неизвестный способ задания воздухообмена")
+        if self.infiltration_basis not in {
+            "manual_flow",
+            "none",
+            "appendix8_residential_exhaust",
+            "appendix8_envelope",
+            "quick_estimate",
+        }:
+            raise ValueError("Неизвестный способ задания инфильтрации")
+        if self.infiltration_basis == "appendix8_envelope" and not self.infiltration_paths:
+            raise ValueError("Для формулы 3 приложения 8 нужна хотя бы одна группа ограждений")
+        if self.infiltration_basis != "appendix8_envelope" and self.infiltration_paths:
+            raise ValueError("Группы воздухопроницаемости допустимы только для формулы 3")
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,6 +316,21 @@ class LossLine:
     u_value: float | None
     delta_t_k: float
     watts: float
+    surface_kind: SurfaceKind | None = None
+
+    def __post_init__(self) -> None:
+        if not self.name.strip():
+            raise ValueError("Название строки теплопотерь не может быть пустым")
+        if not self.kind.strip():
+            raise ValueError("Тип строки теплопотерь не может быть пустым")
+        if self.area_m2 is not None:
+            _require_finite_range(self.area_m2, "Площадь/длина строки", 0.0, 1_000_000.0)
+        if self.u_value is not None:
+            _require_finite_range(self.u_value, "U/ψ строки", 0.0, 1_000.0)
+        _require_finite_range(self.delta_t_k, "ΔT строки, K", 0.0, 200.0)
+        _require_finite_range(self.watts, "Теплопотери строки, Вт", 0.0, 1_000_000_000.0)
+        if self.surface_kind is not None and self.surface_kind not in tuple(SurfaceKind):
+            raise ValueError("Неизвестный тип поверхности строки")
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,6 +340,23 @@ class HeatLossResult:
     total_w: float
     recommended_w: float
     lines: tuple[LossLine, ...]
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.transmission_w, "Трансмиссионные потери, Вт"),
+            (self.ventilation_w, "Воздушные потери, Вт"),
+            (self.total_w, "Итоговые потери, Вт"),
+            (self.recommended_w, "Рекомендуемая мощность, Вт"),
+        ):
+            _require_finite_range(value, label, 0.0, 1_000_000_000.0)
+        component_total = self.transmission_w + self.ventilation_w
+        if not math.isclose(self.total_w, component_total, rel_tol=1e-9, abs_tol=1e-6):
+            raise ValueError("Итоговые потери не равны сумме ограждений и воздухообмена")
+        line_total = sum(line.watts for line in self.lines)
+        if not math.isclose(self.total_w, line_total, rel_tol=1e-9, abs_tol=1e-6):
+            raise ValueError("Итоговые потери не равны сумме строк расчёта")
+        if self.recommended_w + 1e-6 < self.total_w:
+            raise ValueError("Рекомендуемая мощность не может быть ниже расчётной")
 
     @property
     def total_kw(self) -> float:
